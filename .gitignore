@@ -1,10 +1,13 @@
 # Build output
 /claude-usage-agent
+/claude-sub-agent
 /bin/
 
 # Go
 *.test
 *.out
+coverage.out
+coverage.html
 
 # OS
 .DS_Store
