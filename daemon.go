@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"os"
 	"os/signal"
@@ -30,9 +31,7 @@ func runDaemon(cfg daemonConfig) {
 	var loops []func(context.Context)
 
 	loops = append(loops, func(ctx context.Context) {
-		runLoop(ctx, "collect", cfg.collectInterval, func() {
-			collectOnce(ctx, cfg)
-		})
+		collectLoop(ctx, cfg)
 	})
 
 	if cfg.keepaliveEnabled {
@@ -95,18 +94,62 @@ func safe(fn func(), name string) {
 	fn()
 }
 
-// collectOnce is the per-tick collect+push pipeline used by both the daemon's
-// collect loop and the `collect` subcommand.
-func collectOnce(ctx context.Context, cfg daemonConfig) {
+// collectLoop runs collect+push with exponential backoff on 429 rate-limit errors.
+// On success or non-rate-limit errors the interval resets to cfg.collectInterval.
+func collectLoop(ctx context.Context, cfg daemonConfig) {
+	const maxBackoff = 30 * time.Minute
+	interval := cfg.collectInterval
+	nextWait := interval
+
+	rateLimited := safeCollect(ctx, cfg)
+	if rateLimited {
+		nextWait = min(nextWait*2, maxBackoff)
+		log.Printf("collect: rate limited, backing off — next attempt in %s", nextWait)
+	}
+
+	timer := time.NewTimer(nextWait)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			rateLimited = safeCollect(ctx, cfg)
+			if rateLimited {
+				nextWait = min(nextWait*2, maxBackoff)
+				log.Printf("collect: rate limited, backing off — next attempt in %s", nextWait)
+			} else {
+				nextWait = interval
+			}
+			timer.Reset(nextWait)
+		}
+	}
+}
+
+// safeCollect wraps collectOnce in panic recovery and returns true when the
+// collect cycle was rate-limited (so the caller can apply a backoff).
+func safeCollect(ctx context.Context, cfg daemonConfig) (rateLimited bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("collect: panic recovered: %v", r)
+		}
+	}()
+	return collectOnce(ctx, cfg)
+}
+
+// collectOnce is the per-tick collect+push pipeline. Returns true if the API
+// responded with 429 (rate limited) so callers can apply backoff.
+func collectOnce(ctx context.Context, cfg daemonConfig) bool {
 	start := time.Now()
 	payload, ops, err := cfg.collector.Collect(ctx)
 	if err != nil {
 		log.Printf("collect: %v ops=%v (%v)", err, ops, time.Since(start))
-		return
+		return errors.Is(err, ErrRateLimit)
 	}
 	if err := cfg.pusher.Push(ctx, payload); err != nil {
 		log.Printf("collect: push failed ops=%v err=%v (%v)", ops, err, time.Since(start))
-		return
+		return false
 	}
 	log.Printf("collect: ok ops=%v (%v)", ops, time.Since(start))
+	return false
 }

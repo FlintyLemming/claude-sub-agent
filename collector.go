@@ -25,6 +25,9 @@ const KeychainService = "Claude Code-credentials"
 // ErrNoToken is returned when the OAuth token cannot be read from Keychain.
 var ErrNoToken = errors.New("cannot read OAuth token from Keychain")
 
+// ErrRateLimit is returned when the usage API responds with 429 Too Many Requests.
+var ErrRateLimit = errors.New("rate limited")
+
 // TokenProvider reads the raw Claude Code credentials JSON out of macOS Keychain.
 // Abstracted as an interface so tests can inject a stub instead of shelling out
 // to the real `security` command.
@@ -175,6 +178,10 @@ func (c *Collector) Collect(ctx context.Context) (payload *Payload, ops []string
 	if status == http.StatusUnauthorized {
 		ops = append(ops, "api-failed")
 		return nil, ops, errors.New("usage api: still unauthorized after refresh")
+	}
+	if status == http.StatusTooManyRequests {
+		ops = append(ops, "api-failed")
+		return nil, ops, fmt.Errorf("usage api: %w", ErrRateLimit)
 	}
 	if status < 200 || status >= 300 {
 		ops = append(ops, "api-failed")
