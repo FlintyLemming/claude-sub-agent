@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -24,6 +26,31 @@ func (s *securityTokens) Credentials() ([]byte, error) {
 		return nil, fmt.Errorf("security find-generic-password: %w", err)
 	}
 	return []byte(strings.TrimSpace(string(out))), nil
+}
+
+// fileTokens reads credentials from ~/.claude/.credentials.json file.
+// This is used as a fallback when Keychain access fails.
+type fileTokens struct {
+	path string
+}
+
+func newFileTokens() TokenProvider {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		// Fallback to security tokens if we can't determine home dir
+		return newSecurityTokens()
+	}
+	return &fileTokens{
+		path: filepath.Join(home, ".claude", ".credentials.json"),
+	}
+}
+
+func (f *fileTokens) Credentials() ([]byte, error) {
+	data, err := os.ReadFile(f.path)
+	if err != nil {
+		return nil, fmt.Errorf("read credentials file: %w", err)
+	}
+	return data, nil
 }
 
 // cliRefresher keeps the session/token alive by running a no-op Claude Code

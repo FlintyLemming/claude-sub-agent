@@ -182,10 +182,11 @@ func cmdStatus() {
 	}
 }
 
-// newCollector wires the production Keychain + CLI implementations.
+// newCollector wires the production file-based token + CLI implementations.
+// Uses ~/.claude/.credentials.json as the primary token source.
 func newCollector() *Collector {
 	return &Collector{
-		Tokens:    newSecurityTokens(),
+		Tokens:    newFileTokens(),
 		Refresher: newCLIRefresher(),
 		API:       newUsageAPI(UsageAPIURL),
 	}
