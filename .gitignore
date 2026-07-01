@@ -1,0 +1,10 @@
+# Build output
+/claude-usage-agent
+/bin/
+
+# Go
+*.test
+*.out
+
+# OS
+.DS_Store
