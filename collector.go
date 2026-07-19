@@ -107,11 +107,13 @@ type apiResponse struct {
 	} `json:"five_hour"`
 }
 
-// Payload is the exact shape POSTed to the push URL. See the design doc §4:
-// only seven_day and five_hour utilization + resets_at are forwarded.
+// Payload is the exact shape POSTed to the push URL. The ai-plan-insight v2
+// ClaudePushRequest schema requires both seven_day and five_hour, so neither
+// field is optional here — Collect fails instead of pushing a partial payload
+// the server would reject with 422.
 type Payload struct {
-	SevenDay *quota `json:"seven_day,omitempty"`
-	FiveHour *quota `json:"five_hour,omitempty"`
+	SevenDay quota `json:"seven_day"`
+	FiveHour quota `json:"five_hour"`
 }
 
 type quota struct {
@@ -194,10 +196,15 @@ func (c *Collector) Collect(ctx context.Context) (payload *Payload, ops []string
 		return nil, ops, fmt.Errorf("decode usage response: %w", err)
 	}
 
+	if apiResp.SevenDay == nil || apiResp.FiveHour == nil {
+		ops = append(ops, "api-failed")
+		return nil, ops, errors.New("usage response missing seven_day or five_hour (both required by the v2 push API)")
+	}
+
 	ops = append(ops, "api-ok")
 	return &Payload{
-		SevenDay: toQuota(apiResp.SevenDay),
-		FiveHour: toQuota(apiResp.FiveHour),
+		SevenDay: quota{Utilization: apiResp.SevenDay.Utilization, ResetsAt: apiResp.SevenDay.ResetsAt},
+		FiveHour: quota{Utilization: apiResp.FiveHour.Utilization, ResetsAt: apiResp.FiveHour.ResetsAt},
 	}, ops, nil
 }
 
@@ -207,14 +214,4 @@ func (c *Collector) readToken() (string, error) {
 		return "", fmt.Errorf("%w: %v", ErrNoToken, err)
 	}
 	return accessToken(raw)
-}
-
-func toQuota(in *struct {
-	Utilization float64 `json:"utilization"`
-	ResetsAt    string  `json:"resets_at"`
-}) *quota {
-	if in == nil {
-		return nil
-	}
-	return &quota{Utilization: in.Utilization, ResetsAt: in.ResetsAt}
 }

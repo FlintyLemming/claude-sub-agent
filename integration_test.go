@@ -35,6 +35,9 @@ func TestCollectAndPush_Pipeline(t *testing.T) {
 		if ct := r.Header.Get("Content-Type"); ct != "application/json" {
 			t.Errorf("push: Content-Type = %q", ct)
 		}
+		if auth := r.Header.Get("Authorization"); auth != "Bearer v2-secret" {
+			t.Errorf("push: Authorization = %q, want Bearer v2-secret", auth)
+		}
 		buf := new(bytes.Buffer)
 		buf.ReadFrom(r.Body)
 		received.Store(buf.Bytes())
@@ -49,6 +52,7 @@ func TestCollectAndPush_Pipeline(t *testing.T) {
 		API:       newUsageAPI(usageSrv.URL),
 	}
 	pusher := testPusher(pushSrv.URL, 5*time.Second, time.Millisecond)
+	pusher.Token = "v2-secret"
 
 	// Drive the same pipeline the daemon uses.
 	ctx := context.Background()
@@ -62,16 +66,16 @@ func TestCollectAndPush_Pipeline(t *testing.T) {
 		t.Fatal("push server received no request")
 	}
 
-	// The POST body must match the design-doc sample exactly: seven_day +
-	// five_hour only, no extra_usage.
+	// The POST body must match the v2 ClaudePushRequest schema exactly:
+	// seven_day + five_hour only (both required), no extra_usage.
 	var got Payload
 	if err := json.Unmarshal(raw, &got); err != nil {
 		t.Fatalf("unmarshal posted body: %v\nbody: %s", err, raw)
 	}
-	if got.SevenDay == nil || got.SevenDay.Utilization != 45.2 || got.SevenDay.ResetsAt != "2026-07-08T12:00:00Z" {
+	if got.SevenDay.Utilization != 45.2 || got.SevenDay.ResetsAt != "2026-07-08T12:00:00Z" {
 		t.Errorf("seven_day = %+v", got.SevenDay)
 	}
-	if got.FiveHour == nil || got.FiveHour.Utilization != 12.8 || got.FiveHour.ResetsAt != "2026-07-01T15:00:00Z" {
+	if got.FiveHour.Utilization != 12.8 || got.FiveHour.ResetsAt != "2026-07-01T15:00:00Z" {
 		t.Errorf("five_hour = %+v", got.FiveHour)
 	}
 

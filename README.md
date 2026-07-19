@@ -15,9 +15,12 @@ Every collection cycle:
 
 ### Payload
 
+The push target is an [ai-plan-insight](../ai-plan-insight) **v2** push endpoint: `POST /api/push/v2/{instance_id}`, where `instance_id` is a `type: "claude", mode: "push"` instance registered in the server's `config.v2.json`.
+
 ```http
-POST <push-url>   (default http://localhost:8000/api/push/claude)
+POST <push-url>   (default http://localhost:8000/api/push/v2/claude-personal)
 Content-Type: application/json
+Authorization: Bearer <push-token>
 
 {
   "seven_day": { "utilization": 45.2, "resets_at": "2026-07-08T12:00:00Z" },
@@ -25,7 +28,9 @@ Content-Type: application/json
 }
 ```
 
-Only `seven_day` and `five_hour` `utilization` + `resets_at` are forwarded. `resets_at` is passed through verbatim (no timezone conversion) — the receiving service owns all formatting.
+The body matches the server's `ClaudePushRequest` schema: `seven_day` and `five_hour` are **both required**, so a usage response missing either window fails the cycle instead of pushing a payload the server would reject with `422`. `resets_at` is passed through verbatim (no timezone conversion) — the receiving service owns all formatting.
+
+The Bearer token must match the server's `push_auth_secret`. When the server runs with `enforce_push_auth: false` the token may be omitted; with `enforce_push_auth: true` a missing/wrong token gets `401` (not retried).
 
 ## Install
 
@@ -51,12 +56,13 @@ Commands:
 
 ### Flags (`daemon` / `collect`)
 
-| Flag                    | Env var                            | Default                                   | Description         |
-| ----------------------- | ---------------------------------- | ----------------------------------------- | ------------------- |
-| `--push-url`            | `CLAUDE_USAGE_PUSH_URL`            | `http://localhost:8000/api/push/claude`   | Push target         |
-| `--interval`            | `CLAUDE_USAGE_INTERVAL`            | `5m`                                      | Collect interval    |
-| `--keepalive-interval`  | `CLAUDE_USAGE_KEEPALIVE_INTERVAL`  | `30m`                                     | Keepalive interval  |
-| `--keepalive`           | `CLAUDE_USAGE_KEEPALIVE`           | `true`                                    | Enable keepalive    |
+| Flag                    | Env var                            | Default                                              | Description                                  |
+| ----------------------- | ---------------------------------- | ---------------------------------------------------- | -------------------------------------------- |
+| `--push-url`            | `CLAUDE_USAGE_PUSH_URL`            | `http://localhost:8000/api/push/v2/claude-personal`  | v2 push endpoint (`/api/push/v2/{instance}`) |
+| `--push-token`          | `CLAUDE_USAGE_PUSH_TOKEN`          | (empty)                                              | Bearer token = server `push_auth_secret`     |
+| `--interval`            | `CLAUDE_USAGE_INTERVAL`            | `5m`                                                 | Collect interval                             |
+| `--keepalive-interval`  | `CLAUDE_USAGE_KEEPALIVE_INTERVAL`  | `30m`                                                | Keepalive interval                           |
+| `--keepalive`           | `CLAUDE_USAGE_KEEPALIVE`           | `true`                                               | Enable keepalive                             |
 
 **Precedence:** flag > env > default.
 

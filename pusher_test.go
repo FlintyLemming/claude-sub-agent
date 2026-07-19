@@ -38,8 +38,8 @@ func TestPusher_Success(t *testing.T) {
 
 	p := testPusher(srv.URL, 5*time.Second, time.Millisecond)
 	err := p.Push(context.Background(), &Payload{
-		SevenDay: &quota{Utilization: 42.0, ResetsAt: "2026-07-08T12:00:00Z"},
-		FiveHour: &quota{Utilization: 9.0, ResetsAt: "2026-07-01T15:00:00Z"},
+		SevenDay: quota{Utilization: 42.0, ResetsAt: "2026-07-08T12:00:00Z"},
+		FiveHour: quota{Utilization: 9.0, ResetsAt: "2026-07-01T15:00:00Z"},
 	})
 	if err != nil {
 		t.Fatalf("Push err = %v", err)
@@ -50,6 +50,33 @@ func TestPusher_Success(t *testing.T) {
 	// Body should contain the utilization value.
 	if s := string(lastBody); !containsStr(s, "42") {
 		t.Errorf("body = %q, want utilization 42", s)
+	}
+}
+
+func TestPusher_BearerToken(t *testing.T) {
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	p := testPusher(srv.URL, 5*time.Second, time.Millisecond)
+	p.Token = "s3cret"
+	if err := p.Push(context.Background(), &Payload{}); err != nil {
+		t.Fatalf("Push err = %v", err)
+	}
+	if gotAuth != "Bearer s3cret" {
+		t.Errorf("Authorization = %q, want Bearer s3cret", gotAuth)
+	}
+
+	// Without a token, no Authorization header is sent.
+	p.Token = ""
+	if err := p.Push(context.Background(), &Payload{}); err != nil {
+		t.Fatalf("Push err = %v", err)
+	}
+	if gotAuth != "" {
+		t.Errorf("Authorization = %q, want empty when no token configured", gotAuth)
 	}
 }
 
@@ -68,7 +95,7 @@ func TestPusher_5xxRetries(t *testing.T) {
 
 	// Speed up the retry backoff so the test is fast.
 	p := testPusher(srv.URL, 5*time.Second, 5*time.Millisecond)
-	err := p.Push(context.Background(), &Payload{SevenDay: &quota{Utilization: 1, ResetsAt: "x"}})
+	err := p.Push(context.Background(), &Payload{SevenDay: quota{Utilization: 1, ResetsAt: "x"}})
 	if err != nil {
 		t.Fatalf("Push err = %v, want nil after retries", err)
 	}
@@ -86,7 +113,7 @@ func TestPusher_5xxExhaustsRetries(t *testing.T) {
 	defer srv.Close()
 
 	p := testPusher(srv.URL, 5*time.Second, time.Millisecond)
-	err := p.Push(context.Background(), &Payload{SevenDay: &quota{Utilization: 1, ResetsAt: "x"}})
+	err := p.Push(context.Background(), &Payload{SevenDay: quota{Utilization: 1, ResetsAt: "x"}})
 	if err == nil {
 		t.Fatal("Push err = nil, want error after exhausting retries")
 	}
@@ -105,7 +132,7 @@ func TestPusher_4xxNoRetry(t *testing.T) {
 	defer srv.Close()
 
 	p := testPusher(srv.URL, 5*time.Second, time.Millisecond)
-	err := p.Push(context.Background(), &Payload{SevenDay: &quota{Utilization: 1, ResetsAt: "x"}})
+	err := p.Push(context.Background(), &Payload{SevenDay: quota{Utilization: 1, ResetsAt: "x"}})
 	if err == nil {
 		t.Fatal("Push err = nil, want error for 4xx")
 	}
@@ -120,7 +147,7 @@ func TestPusher_TransportErrorRetries(t *testing.T) {
 	srv.Close()
 
 	p := testPusher(srv.URL, 5*time.Second, time.Millisecond)
-	err := p.Push(context.Background(), &Payload{SevenDay: &quota{Utilization: 1, ResetsAt: "x"}})
+	err := p.Push(context.Background(), &Payload{SevenDay: quota{Utilization: 1, ResetsAt: "x"}})
 	if err == nil {
 		t.Fatal("Push err = nil, want transport error")
 	}
@@ -140,7 +167,7 @@ func TestPusher_ContextCancelAborts(t *testing.T) {
 	defer cancel()
 
 	p := testPusher(srv.URL, 5*time.Second, 200*time.Millisecond)
-	err := p.Push(ctx, &Payload{SevenDay: &quota{Utilization: 1, ResetsAt: "x"}})
+	err := p.Push(ctx, &Payload{SevenDay: quota{Utilization: 1, ResetsAt: "x"}})
 	if err == nil {
 		t.Fatal("Push err = nil, want ctx cancellation error")
 	}

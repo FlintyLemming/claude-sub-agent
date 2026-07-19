@@ -22,15 +22,20 @@ const defaultBaseBackoff = 1 * time.Second
 // Pusher POSTs a Payload to the configured push URL, retrying transient
 // failures with exponential backoff.
 type Pusher struct {
-	URL         string
+	URL string
+	// Token is the ai-plan-insight v2 push_auth_secret, sent as a Bearer
+	// token. Empty means no Authorization header (server with
+	// enforce_push_auth=false).
+	Token       string
 	Client      *http.Client
 	baseBackoff time.Duration
 }
 
 // NewPusher builds a Pusher with a sane default timeout and backoff.
-func NewPusher(url string) *Pusher {
+func NewPusher(url, token string) *Pusher {
 	return &Pusher{
 		URL:         url,
+		Token:       token,
 		Client:      &http.Client{Timeout: 30 * time.Second},
 		baseBackoff: defaultBaseBackoff,
 	}
@@ -77,6 +82,9 @@ func (p *Pusher) doPost(ctx context.Context, body []byte) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if p.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+p.Token)
+	}
 
 	resp, err := p.Client.Do(req)
 	if err != nil {

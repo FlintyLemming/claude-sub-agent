@@ -250,6 +250,30 @@ func TestCollector_NoTokenInKeychain(t *testing.T) {
 	}
 }
 
+func TestCollector_MissingWindowRejected(t *testing.T) {
+	// v2 ClaudePushRequest requires both seven_day and five_hour; a response
+	// missing either must fail collection instead of producing a partial payload.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"seven_day": {"utilization": 10, "resets_at": "2026-07-08T12:00:00Z"}}`))
+	}))
+	defer srv.Close()
+
+	c := &Collector{
+		Tokens:    &stubTokens{cred: credJSON(t, "tok")},
+		Refresher: &stubRefresher{},
+		API:       newHTTPUsageAPI(t, srv.URL),
+	}
+
+	_, ops, err := c.Collect(context.Background())
+	if err == nil {
+		t.Fatal("Collect err = nil, want error for missing five_hour")
+	}
+	if !contains(ops, "api-failed") {
+		t.Errorf("ops = %v, want api-failed", ops)
+	}
+}
+
 func contains(slice []string, s string) bool {
 	for _, v := range slice {
 		if v == s {

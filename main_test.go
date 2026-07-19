@@ -10,8 +10,11 @@ func TestParseRuntimeFlags_Defaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err = %v", err)
 	}
-	if cfg.pushURL != "http://localhost:8000/api/push/claude" {
+	if cfg.pushURL != "http://localhost:8000/api/push/v2/claude-personal" {
 		t.Errorf("pushURL = %q", cfg.pushURL)
+	}
+	if cfg.pushToken != "" {
+		t.Errorf("pushToken = %q, want empty default", cfg.pushToken)
 	}
 	if cfg.interval != 5*time.Minute {
 		t.Errorf("interval = %v", cfg.interval)
@@ -75,7 +78,7 @@ func TestParseRuntimeFlags_EffectiveArgsPersisted(t *testing.T) {
 		joined += a + " "
 	}
 	for _, want := range []string{
-		"--push-url=http://localhost:8000/api/push/claude",
+		"--push-url=http://localhost:8000/api/push/v2/claude-personal",
 		"--interval=2m0s",
 		"--keepalive-interval=30m0s",
 		"--keepalive=true",
@@ -84,6 +87,40 @@ func TestParseRuntimeFlags_EffectiveArgsPersisted(t *testing.T) {
 			t.Errorf("effectiveArgs missing %q: %v", want, cfg.effectiveArgs)
 		}
 	}
+	// No token configured → no --push-token arg persisted.
+	if containsStr(joined, "--push-token=") {
+		t.Errorf("effectiveArgs should omit --push-token when unset: %v", cfg.effectiveArgs)
+	}
+}
+
+func TestParseRuntimeFlags_PushToken(t *testing.T) {
+	t.Setenv("CLAUDE_USAGE_PUSH_TOKEN", "from-env")
+	cfg, err := parseRuntimeFlags(nil)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if cfg.pushToken != "from-env" {
+		t.Errorf("pushToken = %q, want from-env", cfg.pushToken)
+	}
+
+	cfg, err = parseRuntimeFlags([]string{"--push-token=from-flag"})
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if cfg.pushToken != "from-flag" {
+		t.Errorf("pushToken = %q, want flag to beat env", cfg.pushToken)
+	}
+	if !containsStr(joinArgs(cfg.effectiveArgs), "--push-token=from-flag") {
+		t.Errorf("effectiveArgs missing --push-token: %v", cfg.effectiveArgs)
+	}
+}
+
+func joinArgs(args []string) string {
+	joined := ""
+	for _, a := range args {
+		joined += a + " "
+	}
+	return joined
 }
 
 func TestEnvBoolOr_Values(t *testing.T) {

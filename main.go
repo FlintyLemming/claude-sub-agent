@@ -24,8 +24,12 @@ Commands:
   status      Show the launchd status of the agent.
 
 Flags (daemon / collect):
-  --push-url             HTTP endpoint to POST payloads to
+  --push-url             HTTP endpoint to POST payloads to; must be an
+                         ai-plan-insight v2 push endpoint
+                         /api/push/v2/{instance_id}
                          (env CLAUDE_USAGE_PUSH_URL)
+  --push-token           Bearer token matching the server's push_auth_secret
+                         (env CLAUDE_USAGE_PUSH_TOKEN)
   --interval             Collect interval (default 5m)
                          (env CLAUDE_USAGE_INTERVAL)
   --keepalive-interval   Keepalive interval (default 30m)
@@ -70,6 +74,7 @@ func main() {
 // resolution. Fields are populated by parseRuntimeFlags.
 type runtimeFlags struct {
 	pushURL           string
+	pushToken         string
 	interval          time.Duration
 	keepalive         bool
 	keepaliveInterval time.Duration
@@ -85,12 +90,14 @@ func parseRuntimeFlags(restArgs []string) (runtimeFlags, error) {
 	fs.SetOutput(os.Stderr)
 
 	cfg := runtimeFlags{
-		pushURL:           envOr("CLAUDE_USAGE_PUSH_URL", "http://localhost:8000/api/push/claude"),
+		pushURL:           envOr("CLAUDE_USAGE_PUSH_URL", "http://localhost:8000/api/push/v2/claude-personal"),
+		pushToken:         envOr("CLAUDE_USAGE_PUSH_TOKEN", ""),
 		interval:          envDurOr("CLAUDE_USAGE_INTERVAL", 5*time.Minute),
 		keepalive:         envBoolOr("CLAUDE_USAGE_KEEPALIVE", true),
 		keepaliveInterval: envDurOr("CLAUDE_USAGE_KEEPALIVE_INTERVAL", 30*time.Minute),
 	}
-	fs.StringVar(&cfg.pushURL, "push-url", cfg.pushURL, "HTTP endpoint to POST payloads to")
+	fs.StringVar(&cfg.pushURL, "push-url", cfg.pushURL, "HTTP endpoint to POST payloads to (v2: /api/push/v2/{instance_id})")
+	fs.StringVar(&cfg.pushToken, "push-token", cfg.pushToken, "Bearer token matching the server's push_auth_secret")
 	fs.DurationVar(&cfg.interval, "interval", cfg.interval, "collect interval")
 	fs.BoolVar(&cfg.keepalive, "keepalive", cfg.keepalive, "enable keepalive")
 	fs.DurationVar(&cfg.keepaliveInterval, "keepalive-interval", cfg.keepaliveInterval, "keepalive interval")
@@ -106,6 +113,9 @@ func parseRuntimeFlags(restArgs []string) (runtimeFlags, error) {
 		"--interval=" + cfg.interval.String(),
 		"--keepalive-interval=" + cfg.keepaliveInterval.String(),
 		"--keepalive=" + boolStr(cfg.keepalive),
+	}
+	if cfg.pushToken != "" {
+		cfg.effectiveArgs = append(cfg.effectiveArgs, "--push-token="+cfg.pushToken)
 	}
 	return cfg, nil
 }
@@ -127,7 +137,7 @@ func cmdDaemon() {
 		keepaliveEnabled:  cfg.keepalive,
 		keepaliveInterval: cfg.keepaliveInterval,
 		collector:         newCollector(),
-		pusher:            NewPusher(cfg.pushURL),
+		pusher:            NewPusher(cfg.pushURL, cfg.pushToken),
 		keepalive:         &Keepalive{Refresher: newCLIRefresher()},
 	})
 }
@@ -143,7 +153,7 @@ func cmdCollect() {
 		keepaliveEnabled:  false,
 		keepaliveInterval: cfg.keepaliveInterval,
 		collector:         newCollector(),
-		pusher:            NewPusher(cfg.pushURL),
+		pusher:            NewPusher(cfg.pushURL, cfg.pushToken),
 		keepalive:         &Keepalive{Refresher: newCLIRefresher()},
 	})
 }
