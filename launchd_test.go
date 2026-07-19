@@ -40,6 +40,23 @@ func TestRenderPlist_ContainsRequiredKeys(t *testing.T) {
 	}
 }
 
+func TestRenderPlist_BakesUserPATH(t *testing.T) {
+	t.Setenv("PATH", "/opt/homebrew/bin:/usr/bin:/bin")
+	got, err := renderPlist("/bin/x", nil)
+	if err != nil {
+		t.Fatalf("renderPlist err = %v", err)
+	}
+	for _, want := range []string{
+		`<key>EnvironmentVariables</key>`,
+		`<key>PATH</key>`,
+		`<string>/opt/homebrew/bin:/usr/bin:/bin</string>`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("plist missing %q:\n%s", want, got)
+		}
+	}
+}
+
 func TestRenderPlist_XMLEscapesArgs(t *testing.T) {
 	// An arg containing XML-special characters must be escaped, not dropped.
 	got, err := renderPlist("/bin/x", []string{`--push-url=http://h/?a=1&b<2`})

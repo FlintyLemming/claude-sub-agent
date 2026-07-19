@@ -61,6 +61,15 @@ func renderPlist(executable string, args []string) (string, error) {
 		fmt.Fprintf(&b, "        <string>%s</string>\n", escapeXML(a))
 	}
 	fmt.Fprintln(&b, `    </array>`)
+	// launchd starts agents with a minimal PATH (/usr/bin:/bin:...), which
+	// breaks the keepalive/refresh `claude` invocations when the CLI lives in
+	// e.g. /opt/homebrew/bin. Bake the installing user's PATH into the plist.
+	if path := os.Getenv("PATH"); path != "" {
+		fmt.Fprintln(&b, `    <key>EnvironmentVariables</key>`)
+		fmt.Fprintln(&b, `    <dict>`)
+		fmt.Fprintf(&b, "        <key>PATH</key>\n        <string>%s</string>\n", escapeXML(path))
+		fmt.Fprintln(&b, `    </dict>`)
+	}
 	fmt.Fprintf(&b, "    <key>StandardOutPath</key>\n    <string>%s</string>\n", escapeXML(lp))
 	fmt.Fprintf(&b, "    <key>StandardErrorPath</key>\n    <string>%s</string>\n", escapeXML(lp))
 	fmt.Fprintln(&b, `    <key>KeepAlive</key>`)
