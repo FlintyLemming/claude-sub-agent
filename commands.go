@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -26,6 +27,31 @@ func (s *securityTokens) Credentials() ([]byte, error) {
 		return nil, fmt.Errorf("security find-generic-password: %w", err)
 	}
 	return []byte(strings.TrimSpace(string(out))), nil
+}
+
+// chainTokens tries each provider in order and returns the first that yields
+// credentials. It only moves on to the next provider when the previous one
+// errors, so the ordering encodes preference (e.g. file first, Keychain
+// fallback). If every provider fails, all errors are joined so the log shows
+// exactly why each source came up empty.
+type chainTokens struct {
+	providers []TokenProvider
+}
+
+func newChainTokens(providers ...TokenProvider) TokenProvider {
+	return &chainTokens{providers: providers}
+}
+
+func (c *chainTokens) Credentials() ([]byte, error) {
+	var errs []error
+	for _, p := range c.providers {
+		cred, err := p.Credentials()
+		if err == nil {
+			return cred, nil
+		}
+		errs = append(errs, err)
+	}
+	return nil, errors.Join(errs...)
 }
 
 // fileTokens reads credentials from ~/.claude/.credentials.json file.
