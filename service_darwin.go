@@ -4,9 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 )
 
@@ -93,15 +91,6 @@ func escapeXML(s string) string {
 	return r.Replace(s)
 }
 
-// launchctl is swappable so tests can avoid touching the real system.
-type shellRunner func(name string, args ...string) ([]byte, error)
-
-func realShell() shellRunner {
-	return func(name string, args ...string) ([]byte, error) {
-		return exec.Command(name, args...).Output()
-	}
-}
-
 // runInstall writes the plist to ~/Library/LaunchAgents and loads it. If an
 // agent with the same label is already loaded it is unloaded first so the new
 // plist takes effect cleanly. The log dir is created if missing.
@@ -159,15 +148,6 @@ func runUnload(run shellRunner) error {
 	return nil
 }
 
-// status summarises what launchd reports for the agent.
-type statusInfo struct {
-	Label    string
-	Loaded   bool
-	PID      string // empty if not running
-	LastExit string // empty if never exited
-	State    string // human-readable, e.g. "running" / "exited"
-}
-
 // runStatus queries launchctl for the agent's state. When launchctl reports
 // the service as unknown ("Could not find service"), the agent is reported as
 // not-loaded. Any other launchctl error (missing binary, permission denied,
@@ -201,14 +181,4 @@ func runStatus(run shellRunner) (statusInfo, error) {
 		info.State = "loaded (not running)"
 	}
 	return info, nil
-}
-
-// firstMatch returns the first capture group of pattern in text, or "".
-func firstMatch(text, pattern string) string {
-	re := regexp.MustCompile(pattern)
-	m := re.FindStringSubmatch(text)
-	if len(m) < 2 {
-		return ""
-	}
-	return m[1]
 }

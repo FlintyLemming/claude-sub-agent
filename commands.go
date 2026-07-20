@@ -8,26 +8,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 )
-
-// securityTokens reads credentials from macOS Keychain via the `security`
-// tool. Matches the reference project's invocation exactly.
-type securityTokens struct {
-	service string
-}
-
-func newSecurityTokens() TokenProvider {
-	return &securityTokens{service: KeychainService}
-}
-
-func (s *securityTokens) Credentials() ([]byte, error) {
-	cmd := exec.Command("security", "find-generic-password", "-s", s.service, "-w")
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("security find-generic-password: %w", err)
-	}
-	return []byte(strings.TrimSpace(string(out))), nil
-}
 
 // chainTokens tries each provider in order and returns the first that yields
 // credentials. It only moves on to the next provider when the previous one
@@ -54,21 +36,22 @@ func (c *chainTokens) Credentials() ([]byte, error) {
 	return nil, errors.Join(errs...)
 }
 
-// fileTokens reads credentials from ~/.claude/.credentials.json file.
-// This is used as a fallback when Keychain access fails.
+// fileTokens reads credentials from the Claude Code credentials file:
+// $CLAUDE_CONFIG_DIR/.credentials.json when set, else ~/.claude/.credentials.json.
 type fileTokens struct {
 	path string
 }
 
 func newFileTokens() TokenProvider {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		// Fallback to security tokens if we can't determine home dir
-		return newSecurityTokens()
+	dir := os.Getenv("CLAUDE_CONFIG_DIR")
+	if dir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return &fileTokens{path: ""} // Credentials() will fail with a clear error
+		}
+		dir = filepath.Join(home, ".claude")
 	}
-	return &fileTokens{
-		path: filepath.Join(home, ".claude", ".credentials.json"),
-	}
+	return &fileTokens{path: filepath.Join(dir, ".credentials.json")}
 }
 
 func (f *fileTokens) Credentials() ([]byte, error) {
@@ -79,16 +62,49 @@ func (f *fileTokens) Credentials() ([]byte, error) {
 	return data, nil
 }
 
-// cliRefresher keeps the session/token alive by running a no-op Claude Code
-// command. The CLI refreshes and persists its OAuth token as a side effect.
+// fallbackUserAgent is used when `claude --version` is unavailable; a real
+// CLI version string, kept roughly current so the UA stays plausible.
+const fallbackUserAgent = "claude-code/2.1.201"
+
+var (
+	userAgentOnce   sync.Once
+	userAgentCached string
+)
+
+// claudeUserAgent returns "claude-code/<version>" using the installed CLI's
+// version. The subprocess runs once per process (the daemon restarts on
+// upgrade anyway); on any failure the static fallback is used.
+func claudeUserAgent() string {
+	userAgentOnce.Do(func() {
+		userAgentCached = fallbackUserAgent
+		out, err := exec.Command("claude", "--version").Output()
+		if err != nil {
+			return
+		}
+		// Output format: "2.1.201 (Claude Code)".
+		version, _, _ := strings.Cut(strings.TrimSpace(string(out)), " ")
+		if version != "" {
+			userAgentCached = "claude-code/" + version
+		}
+	})
+	return userAgentCached
+}
+
+// cliRefresher rotates an expired OAuth token by running `claude update`. The
+// CLI renews and persists the token as a side effect of any invocation, and
+// `update` is the cheapest one: no model call, so no subscription quota spent.
 type cliRefresher struct{}
 
 func newCLIRefresher() TokenRefresher { return &cliRefresher{} }
 
+func (c *cliRefresher) command(ctx context.Context) *exec.Cmd {
+	return exec.CommandContext(ctx, "claude", "update")
+}
+
 func (c *cliRefresher) Refresh(ctx context.Context) error {
-	cmd := exec.CommandContext(ctx, "claude", "--print", "--model", "haiku", "-p", "hi")
+	cmd := c.command(ctx)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("claude keepalive: %w: %s", err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("claude update: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }

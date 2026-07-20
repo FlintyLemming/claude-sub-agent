@@ -228,8 +228,3 @@ func TestRunStatus_Crashed(t *testing.T) {
 		t.Errorf("LastExit = %q, want 1", info.LastExit)
 	}
 }
-
-type shellCall struct {
-	name string
-	args []string
-}

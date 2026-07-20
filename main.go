@@ -17,11 +17,11 @@ Usage:
   claude-usage-agent <command> [flags]
 
 Commands:
-  daemon      Run continuously: collect every 5m, keepalive every 30m.
+  daemon      Run continuously: collect every 5m.
   collect     Collect once and push (debug/manual).
-  install     Write the launchd plist (with current flags) and load it.
-  uninstall   Unload the agent and delete the plist.
-  status      Show the launchd status of the agent.
+  install     Register the background service (with current flags).
+  uninstall   Unregister the background service.
+  status      Show the service status.
 
 Flags (daemon / collect):
   --push-url             HTTP endpoint to POST payloads to; must be an
@@ -32,10 +32,6 @@ Flags (daemon / collect):
                          (env CLAUDE_USAGE_PUSH_TOKEN)
   --interval             Collect interval (default 5m)
                          (env CLAUDE_USAGE_INTERVAL)
-  --keepalive-interval   Keepalive interval (default 30m)
-                         (env CLAUDE_USAGE_KEEPALIVE_INTERVAL)
-  --keepalive            Enable keepalive (default true)
-                         (env CLAUDE_USAGE_KEEPALIVE)
 
 Precedence: flag > env > default.
 `)
@@ -73,13 +69,11 @@ func main() {
 // runtimeFlags holds the effective daemon/collect configuration after flag/env
 // resolution. Fields are populated by parseRuntimeFlags.
 type runtimeFlags struct {
-	pushURL           string
-	pushToken         string
-	interval          time.Duration
-	keepalive         bool
-	keepaliveInterval time.Duration
+	pushURL   string
+	pushToken string
+	interval  time.Duration
 	// effectiveArgs is the flag form of the resolved values, persisted into the
-	// plist ProgramArguments by `install`.
+	// service definition by `install`.
 	effectiveArgs []string
 }
 
@@ -90,17 +84,20 @@ func parseRuntimeFlags(restArgs []string) (runtimeFlags, error) {
 	fs.SetOutput(os.Stderr)
 
 	cfg := runtimeFlags{
-		pushURL:           envOr("CLAUDE_USAGE_PUSH_URL", "http://localhost:8000/api/push/v2/claude-personal"),
-		pushToken:         envOr("CLAUDE_USAGE_PUSH_TOKEN", ""),
-		interval:          envDurOr("CLAUDE_USAGE_INTERVAL", 5*time.Minute),
-		keepalive:         envBoolOr("CLAUDE_USAGE_KEEPALIVE", true),
-		keepaliveInterval: envDurOr("CLAUDE_USAGE_KEEPALIVE_INTERVAL", 30*time.Minute),
+		pushURL:   envOr("CLAUDE_USAGE_PUSH_URL", "http://localhost:8000/api/push/v2/claude-personal"),
+		pushToken: envOr("CLAUDE_USAGE_PUSH_TOKEN", ""),
+		interval:  envDurOr("CLAUDE_USAGE_INTERVAL", 5*time.Minute),
 	}
 	fs.StringVar(&cfg.pushURL, "push-url", cfg.pushURL, "HTTP endpoint to POST payloads to (v2: /api/push/v2/{instance_id})")
 	fs.StringVar(&cfg.pushToken, "push-token", cfg.pushToken, "Bearer token matching the server's push_auth_secret")
 	fs.DurationVar(&cfg.interval, "interval", cfg.interval, "collect interval")
-	fs.BoolVar(&cfg.keepalive, "keepalive", cfg.keepalive, "enable keepalive")
-	fs.DurationVar(&cfg.keepaliveInterval, "keepalive-interval", cfg.keepaliveInterval, "keepalive interval")
+
+	// Deprecated, ignored: accepted so a service definition written by an older
+	// version (which passed these) doesn't crash-loop the new binary.
+	var deprecatedKeepalive bool
+	var deprecatedKeepaliveInterval time.Duration
+	fs.BoolVar(&deprecatedKeepalive, "keepalive", true, "deprecated: ignored")
+	fs.DurationVar(&deprecatedKeepaliveInterval, "keepalive-interval", 30*time.Minute, "deprecated: ignored")
 
 	if err := fs.Parse(restArgs); err != nil {
 		return cfg, err
@@ -111,20 +108,11 @@ func parseRuntimeFlags(restArgs []string) (runtimeFlags, error) {
 	cfg.effectiveArgs = []string{
 		"--push-url=" + cfg.pushURL,
 		"--interval=" + cfg.interval.String(),
-		"--keepalive-interval=" + cfg.keepaliveInterval.String(),
-		"--keepalive=" + boolStr(cfg.keepalive),
 	}
 	if cfg.pushToken != "" {
 		cfg.effectiveArgs = append(cfg.effectiveArgs, "--push-token="+cfg.pushToken)
 	}
 	return cfg, nil
-}
-
-func boolStr(b bool) string {
-	if b {
-		return "true"
-	}
-	return "false"
 }
 
 func cmdDaemon() {
@@ -133,12 +121,9 @@ func cmdDaemon() {
 		os.Exit(2)
 	}
 	runDaemon(daemonConfig{
-		collectInterval:   cfg.interval,
-		keepaliveEnabled:  cfg.keepalive,
-		keepaliveInterval: cfg.keepaliveInterval,
-		collector:         newCollector(),
-		pusher:            NewPusher(cfg.pushURL, cfg.pushToken),
-		keepalive:         &Keepalive{Refresher: newCLIRefresher()},
+		collectInterval: cfg.interval,
+		collector:       newCollector(),
+		pusher:          NewPusher(cfg.pushURL, cfg.pushToken),
 	})
 }
 
@@ -149,12 +134,9 @@ func cmdCollect() {
 	}
 	ctx := context.Background()
 	collectOnce(ctx, daemonConfig{
-		collectInterval:   cfg.interval,
-		keepaliveEnabled:  false,
-		keepaliveInterval: cfg.keepaliveInterval,
-		collector:         newCollector(),
-		pusher:            NewPusher(cfg.pushURL, cfg.pushToken),
-		keepalive:         &Keepalive{Refresher: newCLIRefresher()},
+		collectInterval: cfg.interval,
+		collector:       newCollector(),
+		pusher:          NewPusher(cfg.pushURL, cfg.pushToken),
 	})
 }
 
@@ -192,13 +174,11 @@ func cmdStatus() {
 	}
 }
 
-// newCollector wires the production token + CLI implementations. The token is
-// read from ~/.claude/.credentials.json first, falling back to the macOS
-// Keychain — either source alone is enough, so a machine that stores creds in
-// only one of them still collects instead of silently failing every cycle.
+// newCollector wires the production token + CLI implementations. The token
+// source is platform-specific (see tokens_darwin.go / tokens_windows.go).
 func newCollector() *Collector {
 	return &Collector{
-		Tokens:    newChainTokens(newFileTokens(), newSecurityTokens()),
+		Tokens:    newPlatformTokens(),
 		Refresher: newCLIRefresher(),
 		API:       newUsageAPI(UsageAPIURL),
 	}

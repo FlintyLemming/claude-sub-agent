@@ -10,6 +10,10 @@ all: build
 build:
 	go build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $(BINARY) .
 
+## build-windows: cross-compile the Windows amd64 binary
+build-windows:
+	GOOS=windows GOARCH=amd64 go build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $(BINARY).exe .
+
 ## run: build then run the daemon in the foreground (use Ctrl-C to stop)
 run: build
 	./$(BINARY) daemon

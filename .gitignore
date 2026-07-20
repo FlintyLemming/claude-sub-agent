@@ -1,6 +1,7 @@
 # Build output
 /claude-usage-agent
 /claude-sub-agent
+*.exe
 /bin/
 
 # Go

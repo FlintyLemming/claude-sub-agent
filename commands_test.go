@@ -1,7 +1,10 @@
 package main
 
 import (
+	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -12,6 +15,37 @@ type fixedTokens struct {
 }
 
 func (f *fixedTokens) Credentials() ([]byte, error) { return f.cred, f.err }
+
+// TestCLIRefresher_UsesUpdateCommand pins the refresh invocation to
+// `claude update`: it rotates an expired OAuth token as a side effect without
+// consuming any model quota, unlike a `claude -p` prompt.
+func TestCLIRefresher_UsesUpdateCommand(t *testing.T) {
+	r := &cliRefresher{}
+	cmd := r.command(context.Background())
+	if len(cmd.Args) != 2 || cmd.Args[0] != "claude" || cmd.Args[1] != "update" {
+		t.Errorf("refresh command args = %v, want [claude update]", cmd.Args)
+	}
+}
+
+// TestFileTokens_HonorsClaudeConfigDir: like Claude Code itself, the file
+// provider must look in $CLAUDE_CONFIG_DIR/.credentials.json when the env var
+// is set, falling back to ~/.claude only when it isn't.
+func TestFileTokens_HonorsClaudeConfigDir(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", dir)
+	blob := []byte(`{"claudeAiOauth":{"accessToken":"from-config-dir"}}`)
+	if err := os.WriteFile(filepath.Join(dir, ".credentials.json"), blob, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := newFileTokens().Credentials()
+	if err != nil {
+		t.Fatalf("Credentials err = %v", err)
+	}
+	if string(got) != string(blob) {
+		t.Errorf("Credentials = %s, want the CLAUDE_CONFIG_DIR blob", got)
+	}
+}
 
 func TestChainTokens(t *testing.T) {
 	errA := errors.New("file missing")

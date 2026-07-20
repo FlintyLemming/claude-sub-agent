@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -25,8 +26,50 @@ const KeychainService = "Claude Code-credentials"
 // ErrNoToken is returned when the OAuth token cannot be read from Keychain.
 var ErrNoToken = errors.New("cannot read OAuth token from Keychain")
 
-// ErrRateLimit is returned when the usage API responds with 429 Too Many Requests.
+// ErrRateLimit is the sentinel matched by errors.Is for 429 responses.
 var ErrRateLimit = errors.New("rate limited")
+
+// rateLimitError carries the server's Retry-After delay alongside the
+// ErrRateLimit identity (zero when the header was absent or unparseable).
+type rateLimitError struct {
+	retryAfter time.Duration
+}
+
+func (e *rateLimitError) Error() string {
+	if e.retryAfter > 0 {
+		return fmt.Sprintf("rate limited (retry after %s)", e.retryAfter)
+	}
+	return "rate limited"
+}
+
+func (e *rateLimitError) Is(target error) bool { return target == ErrRateLimit }
+
+// retryAfterFrom extracts the server-requested delay from a Collect error, or
+// 0 when the error is not rate-limit related or carried no header.
+func retryAfterFrom(err error) time.Duration {
+	var rl *rateLimitError
+	if errors.As(err, &rl) {
+		return rl.retryAfter
+	}
+	return 0
+}
+
+// parseRetryAfter reads the Retry-After header as integer seconds. The
+// HTTP-date form is rare on this endpoint and ignored.
+func parseRetryAfter(header http.Header) time.Duration {
+	if header == nil {
+		return 0
+	}
+	raw := header.Get("Retry-After")
+	if raw == "" {
+		return 0
+	}
+	secs, err := strconv.Atoi(raw)
+	if err != nil || secs < 0 {
+		return 0
+	}
+	return time.Duration(secs) * time.Second
+}
 
 // TokenProvider reads the raw Claude Code credentials JSON out of macOS Keychain.
 // Abstracted as an interface so tests can inject a stub instead of shelling out
@@ -46,14 +89,15 @@ type TokenRefresher interface {
 // so tests can point it at an httptest.Server.
 type UsageAPI interface {
 	// Fetch calls the usage endpoint with the given bearer token. The int is
-	// the HTTP status code; the body is returned raw on any status.
-	Fetch(ctx context.Context, token string) (status int, body []byte, err error)
+	// the HTTP status code; the body and headers are returned raw on any status.
+	Fetch(ctx context.Context, token string) (status int, body []byte, header http.Header, err error)
 }
 
 // usageAPI is the default production implementation backed by http.Client.
 type usageAPI struct {
-	url    string
-	client *http.Client
+	url       string
+	userAgent string
+	client    *http.Client
 }
 
 func newUsageAPI(url string) UsageAPI {
@@ -61,37 +105,48 @@ func newUsageAPI(url string) UsageAPI {
 		url = UsageAPIURL
 	}
 	return &usageAPI{
-		url:    url,
-		client: &http.Client{Timeout: 30 * time.Second},
+		url:       url,
+		userAgent: claudeUserAgent(),
+		client:    &http.Client{Timeout: 30 * time.Second},
 	}
 }
 
-func (u *usageAPI) Fetch(ctx context.Context, token string) (int, []byte, error) {
+func (u *usageAPI) Fetch(ctx context.Context, token string) (int, []byte, http.Header, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.url, nil)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("anthropic-beta", anthropicBetaHeader)
+	req.Header.Set("User-Agent", u.userAgent)
 
 	resp, err := u.client.Do(req)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return resp.StatusCode, nil, err
+		return resp.StatusCode, nil, resp.Header, err
 	}
-	return resp.StatusCode, body, nil
+	return resp.StatusCode, body, resp.Header, nil
 }
 
 // Collector orchestrates: read token → call Usage API → refresh on 401 → retry
-// once → produce a push-ready Payload. It owns no state between calls.
+// once → produce a push-ready Payload. Its only cross-call state is the
+// auth-failure guard below; it is not safe for concurrent Collect calls (the
+// daemon drives it from a single loop).
 type Collector struct {
 	Tokens    TokenProvider
 	Refresher TokenRefresher
 	API       UsageAPI
+
+	// lastFailedToken remembers a token that was still unauthorized after a
+	// refresh. While the credentials source keeps returning it, cycles are
+	// skipped without touching the API — retrying a known-bad token is what
+	// provokes upstream 429s. Cleared when a different token shows up or a
+	// cycle succeeds.
+	lastFailedToken string
 }
 
 // apiResponse mirrors the shape returned by the usage endpoint. Only the
@@ -162,42 +217,94 @@ type quota struct {
 	ResetsAt    string  `json:"resets_at"`
 }
 
-// accessToken extracts the OAuth access token from the Keychain credentials blob.
-func accessToken(raw []byte) (string, error) {
+// expiryLeeway is how close to expiresAt a token is already treated as
+// expired, mirroring the CLI's own ~60s proactive-refresh window.
+const expiryLeeway = 60 * time.Second
+
+// oauthCreds is the decoded token material from the credentials blob.
+// ExpiresAt is zero when the blob carries no expiry (older formats) — such a
+// token is treated as fresh and any staleness surfaces as a 401 instead.
+type oauthCreds struct {
+	Token     string
+	ExpiresAt time.Time
+}
+
+// accessToken extracts the OAuth access token and its expiry from the
+// credentials blob. expiresAt is stored as epoch milliseconds by Claude Code;
+// epoch seconds are accepted too for robustness.
+func accessToken(raw []byte) (oauthCreds, error) {
 	var doc struct {
 		ClaudeAiOauth struct {
-			AccessToken string `json:"accessToken"`
+			AccessToken string  `json:"accessToken"`
+			ExpiresAt   float64 `json:"expiresAt"`
 		} `json:"claudeAiOauth"`
 	}
 	if err := json.Unmarshal(raw, &doc); err != nil {
-		return "", fmt.Errorf("parse credentials JSON: %w", err)
+		return oauthCreds{}, fmt.Errorf("parse credentials JSON: %w", err)
 	}
 	if doc.ClaudeAiOauth.AccessToken == "" {
-		return "", ErrNoToken
+		return oauthCreds{}, ErrNoToken
 	}
-	return doc.ClaudeAiOauth.AccessToken, nil
+	creds := oauthCreds{Token: doc.ClaudeAiOauth.AccessToken}
+	if ts := doc.ClaudeAiOauth.ExpiresAt; ts > 0 {
+		if ts > 1e12 { // milliseconds
+			creds.ExpiresAt = time.UnixMilli(int64(ts))
+		} else { // seconds
+			creds.ExpiresAt = time.Unix(int64(ts), 0)
+		}
+	}
+	return creds, nil
+}
+
+// expired reports whether the token should be refreshed before use.
+func (c oauthCreds) expired(now time.Time) bool {
+	return !c.ExpiresAt.IsZero() && now.After(c.ExpiresAt.Add(-expiryLeeway))
 }
 
 // Collect performs one full collection cycle:
-//  1. read token from Keychain
-//  2. call the usage API
-//  3. on 401, refresh the token via the Claude CLI and retry the API once
-//  4. decode the response into a Payload
+//  1. read token (+ expiry) from the credentials source
+//  2. if expiresAt says the token is stale, refresh via the CLI first
+//  3. call the usage API
+//  4. on 401, refresh the token via the Claude CLI and retry the API once
+//  5. decode the response into a Payload
 //
 // Returns the ops performed (mirrors the reference project's logging style)
 // and either the Payload or an error describing where the cycle failed.
 func (c *Collector) Collect(ctx context.Context) (payload *Payload, ops []string, err error) {
 	ops = []string{}
 
-	token, err := c.readToken()
+	creds, err := c.readToken()
 	if err != nil {
 		return nil, ops, err
 	}
+	if c.lastFailedToken != "" && creds.Token == c.lastFailedToken {
+		return nil, ops, errors.New("auth failed previously and token is unchanged; waiting for the CLI to rotate credentials")
+	}
+
+	// Local expiry check: never spend a request on a token we already know is
+	// stale. If the refresh doesn't rotate it (CLI idle, update a no-op), arm
+	// the guard so we go quiet until new credentials appear.
+	if creds.expired(time.Now()) {
+		ops = append(ops, "refresh-token")
+		log.Printf("collector: token expired locally (expiresAt=%s), refreshing", creds.ExpiresAt.Format(time.RFC3339))
+		if rerr := c.Refresher.Refresh(ctx); rerr != nil {
+			return nil, ops, fmt.Errorf("refresh token: %w", rerr)
+		}
+		creds, err = c.readToken()
+		if err != nil {
+			return nil, ops, err
+		}
+		if creds.expired(time.Now()) {
+			c.lastFailedToken = creds.Token
+			return nil, ops, errors.New("token still expired after refresh; waiting for the CLI to rotate credentials")
+		}
+	}
+	token := creds.Token
 
 	// First API attempt. A transport error yields status 0 + non-nil callErr;
 	// guard against it before the 401 branch so a 401 refresh is only ever
 	// attempted when we actually received an HTTP response.
-	status, body, callErr := c.API.Fetch(ctx, token)
+	status, body, header, callErr := c.API.Fetch(ctx, token)
 	if callErr != nil && status != http.StatusUnauthorized {
 		ops = append(ops, "api-failed")
 		return nil, ops, fmt.Errorf("usage api: %w", callErr)
@@ -208,11 +315,12 @@ func (c *Collector) Collect(ctx context.Context) (payload *Payload, ops []string
 		if rerr := c.Refresher.Refresh(ctx); rerr != nil {
 			return nil, ops, fmt.Errorf("refresh token: %w", rerr)
 		}
-		token, err = c.readToken()
+		creds, err = c.readToken()
 		if err != nil {
 			return nil, ops, err
 		}
-		status, body, callErr = c.API.Fetch(ctx, token)
+		token = creds.Token
+		status, body, header, callErr = c.API.Fetch(ctx, token)
 	}
 	if callErr != nil {
 		ops = append(ops, "api-failed")
@@ -220,11 +328,12 @@ func (c *Collector) Collect(ctx context.Context) (payload *Payload, ops []string
 	}
 	if status == http.StatusUnauthorized {
 		ops = append(ops, "api-failed")
+		c.lastFailedToken = token
 		return nil, ops, errors.New("usage api: still unauthorized after refresh")
 	}
 	if status == http.StatusTooManyRequests {
 		ops = append(ops, "api-failed")
-		return nil, ops, fmt.Errorf("usage api: %w", ErrRateLimit)
+		return nil, ops, fmt.Errorf("usage api: %w", &rateLimitError{retryAfter: parseRetryAfter(header)})
 	}
 	if status < 200 || status >= 300 {
 		ops = append(ops, "api-failed")
@@ -243,6 +352,7 @@ func (c *Collector) Collect(ctx context.Context) (payload *Payload, ops []string
 	}
 
 	ops = append(ops, "api-ok")
+	c.lastFailedToken = ""
 	payload = &Payload{
 		SevenDay: quota{Utilization: apiResp.SevenDay.Utilization, ResetsAt: apiResp.SevenDay.ResetsAt},
 		FiveHour: quota{Utilization: apiResp.FiveHour.Utilization, ResetsAt: apiResp.FiveHour.ResetsAt},
@@ -254,10 +364,10 @@ func (c *Collector) Collect(ctx context.Context) (payload *Payload, ops []string
 	return payload, ops, nil
 }
 
-func (c *Collector) readToken() (string, error) {
+func (c *Collector) readToken() (oauthCreds, error) {
 	raw, err := c.Tokens.Credentials()
 	if err != nil {
-		return "", fmt.Errorf("%w: %v", ErrNoToken, err)
+		return oauthCreds{}, fmt.Errorf("%w: %v", ErrNoToken, err)
 	}
 	return accessToken(raw)
 }

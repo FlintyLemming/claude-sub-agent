@@ -1,69 +1,33 @@
 package main
 
 import (
-	"context"
-	"sync/atomic"
 	"testing"
 	"time"
 )
 
-// TestRunLoop_FiresImmediatelyThenCancels verifies the loop calls fn once at
-// startup (so a fresh daemon reports immediately) and stops cleanly on cancel.
-func TestRunLoop_FiresImmediatelyThenCancels(t *testing.T) {
-	var calls int32
-	ctx, cancel := context.WithCancel(context.Background())
-
-	done := make(chan struct{})
-	go func() {
-		runLoop(ctx, "test", time.Hour, func() {
-			atomic.AddInt32(&calls, 1)
+// TestRateLimitDelay pins the 429 backoff policy: the server's Retry-After
+// wins (clamped between the collect interval and the max backoff); without a
+// header the wait doubles per consecutive rate-limit, capped at the max.
+func TestRateLimitDelay(t *testing.T) {
+	const interval = 5 * time.Minute
+	cases := []struct {
+		name       string
+		retryAfter time.Duration
+		prevWait   time.Duration
+		want       time.Duration
+	}{
+		{"header shorter than interval clamps up", 120 * time.Second, interval, interval},
+		{"header within range used as-is", 17 * time.Minute, interval, 17 * time.Minute},
+		{"header above cap clamps down", 2 * time.Hour, interval, 30 * time.Minute},
+		{"no header doubles previous wait", 0, interval, 10 * time.Minute},
+		{"no header doubling caps at max", 0, 20 * time.Minute, 30 * time.Minute},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := rateLimitDelay(tc.retryAfter, tc.prevWait, interval); got != tc.want {
+				t.Errorf("rateLimitDelay(%v, %v, %v) = %v, want %v",
+					tc.retryAfter, tc.prevWait, interval, got, tc.want)
+			}
 		})
-		close(done)
-	}()
-
-	// Give the immediate fire a moment to land.
-	if !waitFor(func() bool { return atomic.LoadInt32(&calls) >= 1 }, time.Second) {
-		t.Fatal("loop did not fire immediately at startup")
 	}
-
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("loop did not stop after cancel")
-	}
-
-	// No more calls should arrive after cancellation.
-	immediate := atomic.LoadInt32(&calls)
-	time.Sleep(50 * time.Millisecond)
-	if got := atomic.LoadInt32(&calls); got != immediate {
-		t.Errorf("calls increased after cancel: %d -> %d", immediate, got)
-	}
-}
-
-// TestRunLoop_TicksPeriodically verifies the interval timer keeps firing.
-func TestRunLoop_TicksPeriodically(t *testing.T) {
-	var calls int32
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	go runLoop(ctx, "test", 20*time.Millisecond, func() {
-		atomic.AddInt32(&calls, 1)
-	})
-
-	// Initial fire + at least 2 ticks within 200ms.
-	if !waitFor(func() bool { return atomic.LoadInt32(&calls) >= 3 }, time.Second) {
-		t.Fatalf("only %d calls after 1s, want >=3", atomic.LoadInt32(&calls))
-	}
-}
-
-func waitFor(cond func() bool, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if cond() {
-			return true
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	return cond()
 }

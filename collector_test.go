@@ -6,8 +6,10 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // stubTokens returns a fixed credentials blob. keychainFail makes Credentials
@@ -40,6 +42,22 @@ func credJSON(t *testing.T, token string) []byte {
 	t.Helper()
 	b, err := json.Marshal(map[string]any{
 		"claudeAiOauth": map[string]any{"accessToken": token},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// credJSONExpiring builds a credentials blob carrying an expiresAt timestamp
+// (milliseconds since epoch, as Claude Code stores it).
+func credJSONExpiring(t *testing.T, token string, expiresAt time.Time) []byte {
+	t.Helper()
+	b, err := json.Marshal(map[string]any{
+		"claudeAiOauth": map[string]any{
+			"accessToken": token,
+			"expiresAt":   expiresAt.UnixMilli(),
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -337,6 +355,258 @@ func TestCollector_MissingWindowRejected(t *testing.T) {
 	}
 	if !contains(ops, "api-failed") {
 		t.Errorf("ops = %v, want api-failed", ops)
+	}
+}
+
+// TestCollector_SkipsWhenTokenUnchangedAfterAuthFailure: after a cycle ends
+// "still unauthorized after refresh", further cycles must not hit the API (or
+// re-run the refresher) until the on-disk token actually changes — hammering
+// with a known-bad token is what triggers upstream 429s.
+func TestCollector_SkipsWhenTokenUnchangedAfterAuthFailure(t *testing.T) {
+	var apiCalls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&apiCalls, 1)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	refresher := &stubRefresher{}
+	c := &Collector{
+		Tokens:    &stubTokens{cred: credJSON(t, "bad-token")},
+		Refresher: refresher,
+		API:       newHTTPUsageAPI(t, srv.URL),
+	}
+
+	if _, _, err := c.Collect(context.Background()); err == nil {
+		t.Fatal("first Collect err = nil, want auth failure")
+	}
+	callsAfterFirst := atomic.LoadInt32(&apiCalls)
+
+	_, ops, err := c.Collect(context.Background())
+	if err == nil {
+		t.Fatal("second Collect err = nil, want skip error while token unchanged")
+	}
+	if got := atomic.LoadInt32(&apiCalls); got != callsAfterFirst {
+		t.Errorf("api calls %d -> %d; want no new calls while token unchanged", callsAfterFirst, got)
+	}
+	if refresher.calls != 1 {
+		t.Errorf("refresher calls = %d, want 1 (no re-refresh while token unchanged)", refresher.calls)
+	}
+	if len(ops) != 0 {
+		t.Errorf("ops = %v, want none for a skipped cycle", ops)
+	}
+}
+
+// TestCollector_ResumesWhenTokenChanges: the auth-failure guard must clear as
+// soon as a different token appears in the credentials source (the CLI rotated
+// it), letting the next cycle collect normally.
+func TestCollector_ResumesWhenTokenChanges(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer good" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write(usageResp(t, 30.0, "2026-07-26T07:00:00Z", 10.0, "2026-07-20T12:00:00Z"))
+	}))
+	defer srv.Close()
+
+	tok := &stubTokens{cred: credJSON(t, "bad")}
+	c := &Collector{
+		Tokens:    tok,
+		Refresher: &stubRefresher{},
+		API:       newHTTPUsageAPI(t, srv.URL),
+	}
+
+	if _, _, err := c.Collect(context.Background()); err == nil {
+		t.Fatal("first Collect err = nil, want auth failure")
+	}
+
+	// CLI rotates the credentials → guard must lift.
+	tok.cred = credJSON(t, "good")
+	payload, ops, err := c.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect after token change err = %v", err)
+	}
+	if payload.SevenDay.Utilization != 30.0 {
+		t.Errorf("payload = %+v", payload.SevenDay)
+	}
+	if !contains(ops, "api-ok") {
+		t.Errorf("ops = %v, want api-ok", ops)
+	}
+}
+
+// TestCollector_RefreshesLocallyExpiredTokenBeforeAPI: when expiresAt says the
+// token is already (or nearly) expired, the collector must refresh first and
+// never send the doomed request — the API only ever sees the rotated token.
+func TestCollector_RefreshesLocallyExpiredTokenBeforeAPI(t *testing.T) {
+	var apiCalls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&apiCalls, 1)
+		if got := r.Header.Get("Authorization"); got != "Bearer fresh" {
+			t.Errorf("auth header = %q, want Bearer fresh (stale token must never reach the API)", got)
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write(usageResp(t, 40.0, "2026-07-26T07:00:00Z", 5.0, "2026-07-20T12:00:00Z"))
+	}))
+	defer srv.Close()
+
+	tok := &updatingTokens{
+		inner: &stubTokens{cred: credJSONExpiring(t, "stale", time.Now().Add(-time.Hour))},
+		after: credJSONExpiring(t, "fresh", time.Now().Add(8*time.Hour)),
+	}
+	refresher := &swapRefresher{inner: &stubRefresher{}, tok: tok}
+	c := &Collector{Tokens: tok, Refresher: refresher, API: newHTTPUsageAPI(t, srv.URL)}
+
+	payload, ops, err := c.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect err = %v", err)
+	}
+	if got := atomic.LoadInt32(&apiCalls); got != 1 {
+		t.Errorf("api calls = %d, want exactly 1 (no wasted 401 round-trip)", got)
+	}
+	if refresher.inner.calls != 1 {
+		t.Errorf("refresher calls = %d, want 1", refresher.inner.calls)
+	}
+	if payload.SevenDay.Utilization != 40.0 {
+		t.Errorf("payload = %+v", payload.SevenDay)
+	}
+	wantOps := []string{"refresh-token", "api-ok"}
+	if len(ops) != 2 || ops[0] != wantOps[0] || ops[1] != wantOps[1] {
+		t.Errorf("ops = %v, want %v", ops, wantOps)
+	}
+}
+
+// TestCollector_StillExpiredAfterRefreshArmsGuard: if the refresh doesn't
+// rotate the expired token (CLI idle / update no-op), the cycle fails without
+// touching the API, and later cycles stay silent until the token changes.
+func TestCollector_StillExpiredAfterRefreshArmsGuard(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("api must not be called with an expired token")
+	}))
+	defer srv.Close()
+
+	refresher := &stubRefresher{}
+	c := &Collector{
+		Tokens:    &stubTokens{cred: credJSONExpiring(t, "stale", time.Now().Add(-time.Hour))},
+		Refresher: refresher,
+		API:       newHTTPUsageAPI(t, srv.URL),
+	}
+
+	if _, _, err := c.Collect(context.Background()); err == nil {
+		t.Fatal("Collect err = nil, want still-expired failure")
+	}
+	if refresher.calls != 1 {
+		t.Errorf("refresher calls = %d, want 1", refresher.calls)
+	}
+
+	// Second cycle: token unchanged → skip without another refresh.
+	if _, _, err := c.Collect(context.Background()); err == nil {
+		t.Fatal("second Collect err = nil, want skip error")
+	}
+	if refresher.calls != 1 {
+		t.Errorf("refresher calls = %d after skip cycle, want still 1", refresher.calls)
+	}
+}
+
+// TestCollector_FreshExpiryNoRefresh: a token with a future expiresAt goes
+// straight to the API without any refresh.
+func TestCollector_FreshExpiryNoRefresh(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write(usageResp(t, 10.0, "2026-07-26T07:00:00Z", 1.0, "2026-07-20T12:00:00Z"))
+	}))
+	defer srv.Close()
+
+	refresher := &stubRefresher{}
+	c := &Collector{
+		Tokens:    &stubTokens{cred: credJSONExpiring(t, "tok", time.Now().Add(8*time.Hour))},
+		Refresher: refresher,
+		API:       newHTTPUsageAPI(t, srv.URL),
+	}
+
+	if _, _, err := c.Collect(context.Background()); err != nil {
+		t.Fatalf("Collect err = %v", err)
+	}
+	if refresher.calls != 0 {
+		t.Errorf("refresher calls = %d, want 0 for a fresh token", refresher.calls)
+	}
+}
+
+// TestCollector_RateLimitCarriesRetryAfter: a 429 with a Retry-After header
+// must surface both the ErrRateLimit sentinel and the server-requested delay,
+// so the daemon can back off exactly as instructed instead of guessing.
+func TestCollector_RateLimitCarriesRetryAfter(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "120")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	c := &Collector{
+		Tokens:    &stubTokens{cred: credJSON(t, "tok")},
+		Refresher: &stubRefresher{},
+		API:       newHTTPUsageAPI(t, srv.URL),
+	}
+
+	_, _, err := c.Collect(context.Background())
+	if !errors.Is(err, ErrRateLimit) {
+		t.Fatalf("err = %v, want ErrRateLimit", err)
+	}
+	if got := retryAfterFrom(err); got != 120*time.Second {
+		t.Errorf("retryAfterFrom = %v, want 120s", got)
+	}
+}
+
+// TestCollector_RateLimitWithoutHeader: a bare 429 still reports ErrRateLimit
+// with a zero Retry-After, leaving the daemon to its own backoff.
+func TestCollector_RateLimitWithoutHeader(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	c := &Collector{
+		Tokens:    &stubTokens{cred: credJSON(t, "tok")},
+		Refresher: &stubRefresher{},
+		API:       newHTTPUsageAPI(t, srv.URL),
+	}
+
+	_, _, err := c.Collect(context.Background())
+	if !errors.Is(err, ErrRateLimit) {
+		t.Fatalf("err = %v, want ErrRateLimit", err)
+	}
+	if got := retryAfterFrom(err); got != 0 {
+		t.Errorf("retryAfterFrom = %v, want 0 when header absent", got)
+	}
+}
+
+// TestUsageAPI_SendsClaudeCodeUserAgent: requests must present themselves as
+// claude-code/<version> — the default Go-http-client UA is an outlier the
+// endpoint may throttle more aggressively.
+func TestUsageAPI_SendsClaudeCodeUserAgent(t *testing.T) {
+	var gotUA string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUA = r.Header.Get("User-Agent")
+		w.WriteHeader(http.StatusOK)
+		w.Write(usageResp(t, 1, "2026-07-26T07:00:00Z", 1, "2026-07-20T12:00:00Z"))
+	}))
+	defer srv.Close()
+
+	api := newUsageAPI(srv.URL)
+	if _, _, _, err := api.Fetch(context.Background(), "tok"); err != nil {
+		t.Fatalf("Fetch err = %v", err)
+	}
+	if !strings.HasPrefix(gotUA, "claude-code/") {
+		t.Errorf("User-Agent = %q, want claude-code/<version>", gotUA)
+	}
+}
+
+// TestClaudeUserAgent_Fallback: version discovery must always yield a usable
+// claude-code/<version> string, even when the CLI is not on PATH.
+func TestClaudeUserAgent_Fallback(t *testing.T) {
+	if got := claudeUserAgent(); !strings.HasPrefix(got, "claude-code/") {
+		t.Errorf("claudeUserAgent() = %q, want claude-code/ prefix", got)
 	}
 }
 

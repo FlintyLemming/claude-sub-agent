@@ -19,12 +19,6 @@ func TestParseRuntimeFlags_Defaults(t *testing.T) {
 	if cfg.interval != 5*time.Minute {
 		t.Errorf("interval = %v", cfg.interval)
 	}
-	if cfg.keepalive != true {
-		t.Errorf("keepalive = %v", cfg.keepalive)
-	}
-	if cfg.keepaliveInterval != 30*time.Minute {
-		t.Errorf("keepaliveInterval = %v", cfg.keepaliveInterval)
-	}
 }
 
 func TestParseRuntimeFlags_FlagOverridesEnv(t *testing.T) {
@@ -32,7 +26,6 @@ func TestParseRuntimeFlags_FlagOverridesEnv(t *testing.T) {
 	t.Setenv("CLAUDE_USAGE_INTERVAL", "1m")
 	cfg, err := parseRuntimeFlags([]string{
 		"--push-url=http://from-flag:1234",
-		"--keepalive=false",
 	})
 	if err != nil {
 		t.Fatalf("err = %v", err)
@@ -45,24 +38,22 @@ func TestParseRuntimeFlags_FlagOverridesEnv(t *testing.T) {
 	if cfg.interval != time.Minute {
 		t.Errorf("interval = %v, want 1m from env", cfg.interval)
 	}
-	// Flag bool override.
-	if cfg.keepalive != false {
-		t.Errorf("keepalive = %v, want false", cfg.keepalive)
-	}
 }
 
-func TestParseRuntimeFlags_EnvOverridesDefault(t *testing.T) {
-	t.Setenv("CLAUDE_USAGE_KEEPALIVE_INTERVAL", "15m")
-	t.Setenv("CLAUDE_USAGE_KEEPALIVE", "no")
-	cfg, err := parseRuntimeFlags(nil)
+// TestParseRuntimeFlags_DeprecatedKeepaliveAccepted: a plist written by an
+// older version still passes --keepalive/--keepalive-interval; the new binary
+// must parse (and ignore) them instead of crash-looping under launchd.
+func TestParseRuntimeFlags_DeprecatedKeepaliveAccepted(t *testing.T) {
+	cfg, err := parseRuntimeFlags([]string{
+		"--keepalive=true",
+		"--keepalive-interval=30m0s",
+		"--interval=2m",
+	})
 	if err != nil {
-		t.Fatalf("err = %v", err)
+		t.Fatalf("err = %v, want deprecated flags to parse cleanly", err)
 	}
-	if cfg.keepaliveInterval != 15*time.Minute {
-		t.Errorf("keepaliveInterval = %v, want 15m", cfg.keepaliveInterval)
-	}
-	if cfg.keepalive != false {
-		t.Errorf("keepalive = %v, want false (env 'no')", cfg.keepalive)
+	if cfg.interval != 2*time.Minute {
+		t.Errorf("interval = %v", cfg.interval)
 	}
 }
 
@@ -80,8 +71,6 @@ func TestParseRuntimeFlags_EffectiveArgsPersisted(t *testing.T) {
 	for _, want := range []string{
 		"--push-url=http://localhost:8000/api/push/v2/claude-personal",
 		"--interval=2m0s",
-		"--keepalive-interval=30m0s",
-		"--keepalive=true",
 	} {
 		if !containsStr(joined, want) {
 			t.Errorf("effectiveArgs missing %q: %v", want, cfg.effectiveArgs)
@@ -90,6 +79,12 @@ func TestParseRuntimeFlags_EffectiveArgsPersisted(t *testing.T) {
 	// No token configured → no --push-token arg persisted.
 	if containsStr(joined, "--push-token=") {
 		t.Errorf("effectiveArgs should omit --push-token when unset: %v", cfg.effectiveArgs)
+	}
+	// Keepalive is gone: deprecated flags must not be re-persisted into the plist.
+	for _, banned := range []string{"--keepalive=", "--keepalive-interval="} {
+		if containsStr(joined, banned) {
+			t.Errorf("effectiveArgs must not persist %q: %v", banned, cfg.effectiveArgs)
+		}
 	}
 }
 
