@@ -109,6 +109,72 @@ func TestCollector_Success(t *testing.T) {
 	}
 }
 
+func TestCollector_FableWindow(t *testing.T) {
+	// Usage body with a weekly_scoped Fable limit alongside the required windows.
+	body := []byte(`{
+		"seven_day": {"utilization": 25.0, "resets_at": "2026-07-26T07:00:00Z"},
+		"five_hour": {"utilization": 15.0, "resets_at": "2026-07-20T04:40:00Z"},
+		"limits": [
+			{"kind": "session", "percent": 15, "resets_at": "2026-07-20T04:40:00Z"},
+			{"kind": "weekly_all", "percent": 25, "resets_at": "2026-07-26T07:00:00Z"},
+			{"kind": "weekly_scoped", "percent": 44, "resets_at": "2026-07-26T07:00:00Z",
+			 "scope": {"model": {"display_name": "Fable"}}}
+		]
+	}`)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write(body)
+	}))
+	defer srv.Close()
+
+	c := &Collector{
+		Tokens:    &stubTokens{cred: credJSON(t, "tok")},
+		Refresher: &stubRefresher{},
+		API:       newHTTPUsageAPI(t, srv.URL),
+	}
+
+	payload, ops, err := c.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect err = %v", err)
+	}
+	if payload.Fable == nil {
+		t.Fatal("payload.Fable = nil, want captured Fable window")
+	}
+	if payload.Fable.Utilization != 44 || payload.Fable.ResetsAt != "2026-07-26T07:00:00Z" {
+		t.Errorf("fable payload = %+v", payload.Fable)
+	}
+	wantOps := []string{"api-ok", "fable-ok"}
+	if len(ops) != 2 || ops[0] != wantOps[0] || ops[1] != wantOps[1] {
+		t.Errorf("ops = %v, want %v", ops, wantOps)
+	}
+}
+
+func TestCollector_NoFableWindow(t *testing.T) {
+	// The plain usageResp helper has no limits list → Fable stays nil, no op.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write(usageResp(t, 25.0, "2026-07-26T07:00:00Z", 15.0, "2026-07-20T04:40:00Z"))
+	}))
+	defer srv.Close()
+
+	c := &Collector{
+		Tokens:    &stubTokens{cred: credJSON(t, "tok")},
+		Refresher: &stubRefresher{},
+		API:       newHTTPUsageAPI(t, srv.URL),
+	}
+
+	payload, ops, err := c.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect err = %v", err)
+	}
+	if payload.Fable != nil {
+		t.Errorf("payload.Fable = %+v, want nil when no Fable limit present", payload.Fable)
+	}
+	if len(ops) != 1 || ops[0] != "api-ok" {
+		t.Errorf("ops = %v, want [api-ok]", ops)
+	}
+}
+
 func TestCollector_401RefreshSuccess(t *testing.T) {
 	var apiCalls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

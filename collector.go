@@ -105,6 +105,43 @@ type apiResponse struct {
 		Utilization float64 `json:"utilization"`
 		ResetsAt    string  `json:"resets_at"`
 	} `json:"five_hour"`
+	// Limits carries per-scope caps. The model-scoped weekly windows (e.g. the
+	// Fable limit) live here rather than as top-level fields.
+	Limits []apiLimit `json:"limits"`
+}
+
+// apiLimit is one entry of the usage endpoint's limits list. A model-scoped
+// weekly cap has kind "weekly_scoped" with scope.model.display_name naming the
+// model (e.g. "Fable").
+type apiLimit struct {
+	Kind     string  `json:"kind"`
+	Percent  float64 `json:"percent"`
+	ResetsAt string  `json:"resets_at"`
+	Scope    *struct {
+		Model *struct {
+			DisplayName string `json:"display_name"`
+		} `json:"model"`
+	} `json:"scope"`
+}
+
+// fableModel is the display_name (substring) of the Fable model-scoped weekly
+// limit we forward. Matched as a substring so a rename like "Fable 5" still
+// resolves.
+const fableModel = "Fable"
+
+// findFableLimit returns the Fable weekly-scoped window as a quota, or nil when
+// the account has no such cap. It stays optional — its absence never fails a
+// cycle, unlike the required seven_day/five_hour windows.
+func findFableLimit(limits []apiLimit) *quota {
+	for _, l := range limits {
+		if l.Kind != "weekly_scoped" || l.Scope == nil || l.Scope.Model == nil {
+			continue
+		}
+		if strings.Contains(l.Scope.Model.DisplayName, fableModel) {
+			return &quota{Utilization: l.Percent, ResetsAt: l.ResetsAt}
+		}
+	}
+	return nil
 }
 
 // Payload is the exact shape POSTed to the push URL. The ai-plan-insight v2
@@ -114,6 +151,10 @@ type apiResponse struct {
 type Payload struct {
 	SevenDay quota `json:"seven_day"`
 	FiveHour quota `json:"five_hour"`
+	// Fable is the model-scoped weekly window. Optional: omitted (nil) when the
+	// account has no Fable cap, so the server's optional `fable` field stays
+	// unset rather than receiving a zero-valued window.
+	Fable *quota `json:"fable,omitempty"`
 }
 
 type quota struct {
@@ -202,10 +243,15 @@ func (c *Collector) Collect(ctx context.Context) (payload *Payload, ops []string
 	}
 
 	ops = append(ops, "api-ok")
-	return &Payload{
+	payload = &Payload{
 		SevenDay: quota{Utilization: apiResp.SevenDay.Utilization, ResetsAt: apiResp.SevenDay.ResetsAt},
 		FiveHour: quota{Utilization: apiResp.FiveHour.Utilization, ResetsAt: apiResp.FiveHour.ResetsAt},
-	}, ops, nil
+	}
+	if fable := findFableLimit(apiResp.Limits); fable != nil {
+		payload.Fable = fable
+		ops = append(ops, "fable-ok")
+	}
+	return payload, ops, nil
 }
 
 func (c *Collector) readToken() (string, error) {
