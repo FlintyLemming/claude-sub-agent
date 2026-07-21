@@ -43,15 +43,23 @@ type fileTokens struct {
 }
 
 func newFileTokens() TokenProvider {
+	return &fileTokens{path: defaultCredentialsPath()}
+}
+
+// defaultCredentialsPath resolves the Claude Code credentials file location the
+// same way the CLI does: $CLAUDE_CONFIG_DIR/.credentials.json when the env var
+// is set, else ~/.claude/.credentials.json. Returns "" only when the home dir
+// can't be determined (callers then surface a clear read error).
+func defaultCredentialsPath() string {
 	dir := os.Getenv("CLAUDE_CONFIG_DIR")
 	if dir == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {
-			return &fileTokens{path: ""} // Credentials() will fail with a clear error
+			return ""
 		}
 		dir = filepath.Join(home, ".claude")
 	}
-	return &fileTokens{path: filepath.Join(dir, ".credentials.json")}
+	return filepath.Join(dir, ".credentials.json")
 }
 
 func (f *fileTokens) Credentials() ([]byte, error) {

@@ -178,8 +178,11 @@ func cmdStatus() {
 // source is platform-specific (see tokens_darwin.go / tokens_windows.go).
 func newCollector() *Collector {
 	return &Collector{
-		Tokens:    newPlatformTokens(),
-		Refresher: newCLIRefresher(),
+		Tokens: newPlatformTokens(),
+		// Refresh the OAuth token directly against Anthropic's token endpoint
+		// (no quota, actually rotates the token); fall back to `claude update`
+		// only if that fails.
+		Refresher: newChainRefresher(newOAuthRefresher(), newCLIRefresher()),
 		API:       newUsageAPI(UsageAPIURL),
 	}
 }
