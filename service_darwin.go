@@ -60,8 +60,8 @@ func renderPlist(executable string, args []string) (string, error) {
 	}
 	fmt.Fprintln(&b, `    </array>`)
 	// launchd starts agents with a minimal PATH (/usr/bin:/bin:...), which
-	// breaks the keepalive/refresh `claude` invocations when the CLI lives in
-	// e.g. /opt/homebrew/bin. Bake the installing user's PATH into the plist.
+	// breaks the token-refresh `claude` invocation when the CLI lives in e.g.
+	// /opt/homebrew/bin. Bake the installing user's PATH into the plist.
 	if path := os.Getenv("PATH"); path != "" {
 		fmt.Fprintln(&b, `    <key>EnvironmentVariables</key>`)
 		fmt.Fprintln(&b, `    <dict>`)

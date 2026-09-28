@@ -179,10 +179,9 @@ func cmdStatus() {
 func newCollector() *Collector {
 	return &Collector{
 		Tokens: newPlatformTokens(),
-		// Refresh the OAuth token directly against Anthropic's token endpoint
-		// (no quota, actually rotates the token); fall back to `claude update`
-		// only if that fails.
-		Refresher: newChainRefresher(newOAuthRefresher(), newCLIRefresher()),
+		// The CLI rotates the token itself (see cliRefresher), so its refresh
+		// lock and credential store stay authoritative.
+		Refresher: newCLIRefresher(),
 		API:       newUsageAPI(UsageAPIURL),
 	}
 }

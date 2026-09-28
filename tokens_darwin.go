@@ -25,9 +25,10 @@ func (s *securityTokens) Credentials() ([]byte, error) {
 	return []byte(strings.TrimSpace(string(out))), nil
 }
 
-// newPlatformTokens returns the macOS credential chain: the credentials file
-// first, falling back to Keychain — either source alone is enough, so a
-// machine that stores creds in only one of them still collects.
+// newPlatformTokens returns the macOS credential source: whichever of the
+// Keychain (where the CLI keeps its live token) and the credentials file holds
+// the later-expiring token, with the Keychain winning ties. Either source alone
+// is enough, so a machine that stores creds in only one of them still collects.
 func newPlatformTokens() TokenProvider {
-	return newChainTokens(newFileTokens(), newSecurityTokens())
+	return newFreshestTokens(newSecurityTokens(), newFileTokens())
 }

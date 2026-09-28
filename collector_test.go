@@ -360,8 +360,8 @@ func TestCollector_MissingWindowRejected(t *testing.T) {
 
 // TestCollector_SkipsWhenTokenUnchangedAfterAuthFailure: after a cycle ends
 // "still unauthorized after refresh", further cycles must not hit the API (or
-// re-run the refresher) until the on-disk token actually changes — hammering
-// with a known-bad token is what triggers upstream 429s.
+// re-run the refresher) until the token changes or the backoff runs out —
+// hammering with a known-bad token is what triggers upstream 429s.
 func TestCollector_SkipsWhenTokenUnchangedAfterAuthFailure(t *testing.T) {
 	var apiCalls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -478,19 +478,23 @@ func TestCollector_RefreshesLocallyExpiredTokenBeforeAPI(t *testing.T) {
 }
 
 // TestCollector_StillExpiredAfterRefreshArmsGuard: if the refresh doesn't
-// rotate the expired token (CLI idle / update no-op), the cycle fails without
-// touching the API, and later cycles stay silent until the token changes.
+// rotate the expired token (e.g. the CLI's refresh request failed), the cycle
+// fails without touching the API, cycles inside the backoff stay silent, and
+// the refresh is retried once the backoff runs out — the agent must never wait
+// indefinitely for the user to run the CLI.
 func TestCollector_StillExpiredAfterRefreshArmsGuard(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Error("api must not be called with an expired token")
 	}))
 	defer srv.Close()
 
+	clk := &fakeClock{t: time.Now()}
 	refresher := &stubRefresher{}
 	c := &Collector{
 		Tokens:    &stubTokens{cred: credJSONExpiring(t, "stale", time.Now().Add(-time.Hour))},
 		Refresher: refresher,
 		API:       newHTTPUsageAPI(t, srv.URL),
+		now:       clk.now,
 	}
 
 	if _, _, err := c.Collect(context.Background()); err == nil {
@@ -500,12 +504,90 @@ func TestCollector_StillExpiredAfterRefreshArmsGuard(t *testing.T) {
 		t.Errorf("refresher calls = %d, want 1", refresher.calls)
 	}
 
-	// Second cycle: token unchanged → skip without another refresh.
-	if _, _, err := c.Collect(context.Background()); err == nil {
-		t.Fatal("second Collect err = nil, want skip error")
+	// Inside the backoff: token unchanged → skip without another refresh.
+	clk.advance(authRetryDelay(1) - time.Second)
+	if _, ops, err := c.Collect(context.Background()); err == nil || len(ops) != 0 {
+		t.Fatalf("Collect inside backoff = (ops %v, err %v), want a skipped cycle", ops, err)
 	}
 	if refresher.calls != 1 {
 		t.Errorf("refresher calls = %d after skip cycle, want still 1", refresher.calls)
+	}
+
+	// Backoff over: the refresh is attempted again.
+	clk.advance(time.Second)
+	if _, _, err := c.Collect(context.Background()); err == nil {
+		t.Fatal("Collect err = nil, want still-expired failure")
+	}
+	if refresher.calls != 2 {
+		t.Errorf("refresher calls = %d after backoff, want 2", refresher.calls)
+	}
+}
+
+// TestCollector_AuthBackoffDoubles: consecutive refresh failures back off
+// 5m, 10m, …, and a success resets the backoff.
+func TestCollector_AuthBackoffDoubles(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write(usageResp(t, 10.0, "2026-07-26T07:00:00Z", 1.0, "2026-07-20T12:00:00Z"))
+	}))
+	defer srv.Close()
+
+	clk := &fakeClock{t: time.Now()}
+	tok := &stubTokens{cred: credJSONExpiring(t, "stale", time.Now().Add(-time.Hour))}
+	refresher := &stubRefresher{err: errors.New("no network")}
+	c := &Collector{Tokens: tok, Refresher: refresher, API: newHTTPUsageAPI(t, srv.URL), now: clk.now}
+
+	collect := func() error {
+		_, _, err := c.Collect(context.Background())
+		return err
+	}
+
+	if err := collect(); err == nil {
+		t.Fatal("first Collect err = nil, want refresh error")
+	}
+	clk.advance(authRetryDelay(1))
+	if err := collect(); err == nil {
+		t.Fatal("second Collect err = nil, want refresh error")
+	}
+	if refresher.calls != 2 {
+		t.Fatalf("refresher calls = %d, want 2", refresher.calls)
+	}
+
+	// Second failure waits twice as long: one first-failure delay isn't enough.
+	clk.advance(authRetryDelay(1))
+	collect()
+	if refresher.calls != 2 {
+		t.Errorf("refresher calls = %d inside the doubled backoff, want 2", refresher.calls)
+	}
+	clk.advance(authRetryDelay(2) - authRetryDelay(1))
+	collect()
+	if refresher.calls != 3 {
+		t.Errorf("refresher calls = %d after the doubled backoff, want 3", refresher.calls)
+	}
+
+	// The user runs the CLI: a fresh token lifts the guard and resets the count.
+	tok.cred = credJSONExpiring(t, "fresh", time.Now().Add(8*time.Hour))
+	if err := collect(); err != nil {
+		t.Fatalf("Collect with fresh token err = %v", err)
+	}
+	if c.authFailures != 0 {
+		t.Errorf("authFailures = %d after success, want 0", c.authFailures)
+	}
+}
+
+func TestAuthRetryDelay(t *testing.T) {
+	cases := map[int]time.Duration{
+		1:  5 * time.Minute,
+		2:  10 * time.Minute,
+		3:  20 * time.Minute,
+		4:  40 * time.Minute,
+		5:  time.Hour,
+		50: time.Hour,
+	}
+	for n, want := range cases {
+		if got := authRetryDelay(n); got != want {
+			t.Errorf("authRetryDelay(%d) = %v, want %v", n, got, want)
+		}
 	}
 }
 
@@ -609,6 +691,12 @@ func TestClaudeUserAgent_Fallback(t *testing.T) {
 		t.Errorf("claudeUserAgent() = %q, want claude-code/ prefix", got)
 	}
 }
+
+// fakeClock is a settable clock for the collector's auth-failure backoff.
+type fakeClock struct{ t time.Time }
+
+func (f *fakeClock) now() time.Time          { return f.t }
+func (f *fakeClock) advance(d time.Duration) { f.t = f.t.Add(d) }
 
 func contains(slice []string, s string) bool {
 	for _, v := range slice {

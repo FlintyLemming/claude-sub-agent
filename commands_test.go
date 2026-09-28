@@ -5,7 +5,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 // fixedTokens is a TokenProvider stub returning a preset blob or error.
@@ -16,15 +18,54 @@ type fixedTokens struct {
 
 func (f *fixedTokens) Credentials() ([]byte, error) { return f.cred, f.err }
 
-// TestCLIRefresher_UsesUpdateCommand pins the refresh invocation to
-// `claude update`: it rotates an expired OAuth token as a side effect without
-// consuming any model quota, unlike a `claude -p` prompt.
-func TestCLIRefresher_UsesUpdateCommand(t *testing.T) {
-	r := &cliRefresher{}
-	cmd := r.command(context.Background())
-	if len(cmd.Args) != 2 || cmd.Args[0] != "claude" || cmd.Args[1] != "update" {
-		t.Errorf("refresh command args = %v, want [claude update]", cmd.Args)
+// TestCLIRefresher_RunsLocalUsageCommand pins the refresh invocation: the local
+// /usage command (refreshes through the CLI, no model call) behind a guard
+// model, JSON output for the local-command check, and no transcript or MCP
+// servers for the throwaway session.
+func TestCLIRefresher_RunsLocalUsageCommand(t *testing.T) {
+	cmd := (&cliRefresher{}).command(context.Background())
+	want := []string{
+		"claude", "-p", "/usage",
+		"--model", refreshGuardModel,
+		"--output-format", "json",
+		"--no-session-persistence",
+		"--strict-mcp-config",
 	}
+	if strings.Join(cmd.Args, " ") != strings.Join(want, " ") {
+		t.Errorf("refresh command args = %v, want %v", cmd.Args, want)
+	}
+	if cmd.Dir != os.TempDir() {
+		t.Errorf("refresh command dir = %q, want %q", cmd.Dir, os.TempDir())
+	}
+}
+
+func TestCheckLocalUsage(t *testing.T) {
+	t.Run("local /usage run passes", func(t *testing.T) {
+		// Trimmed from real `claude -p /usage --output-format json` output (2.1.283).
+		out := []byte(`{"type":"result","subtype":"success","is_error":false,"num_turns":0,
+			"total_cost_usd":0,"local_command":"usage",
+			"result":"Current session: 10% used · resets Sep 28, 11:09am (UTC)"}`)
+		if err := checkLocalUsage(out); err != nil {
+			t.Errorf("checkLocalUsage = %v, want nil", err)
+		}
+	})
+
+	t.Run("text forwarded to the model fails", func(t *testing.T) {
+		// What a CLI that doesn't run /usage locally returns: one turn, stopped
+		// by the guard model's 404.
+		out := []byte(`{"type":"result","subtype":"success","is_error":true,"num_turns":1,
+			"api_error_status":404,"result":"There's an issue with the selected model (claude-usage-agent-no-inference)."}`)
+		err := checkLocalUsage(out)
+		if err == nil || !strings.Contains(err.Error(), "not run as a local command") {
+			t.Errorf("checkLocalUsage = %v, want not-a-local-command error", err)
+		}
+	})
+
+	t.Run("non-JSON output fails", func(t *testing.T) {
+		if err := checkLocalUsage([]byte("Error: something broke")); err == nil {
+			t.Error("checkLocalUsage = nil, want error for non-JSON output")
+		}
+	})
 }
 
 // TestFileTokens_HonorsClaudeConfigDir: like Claude Code itself, the file
@@ -47,36 +88,80 @@ func TestFileTokens_HonorsClaudeConfigDir(t *testing.T) {
 	}
 }
 
-func TestChainTokens(t *testing.T) {
-	errA := errors.New("file missing")
-	errB := errors.New("keychain empty")
-
-	t.Run("first provider succeeds, later ones not consulted", func(t *testing.T) {
-		second := &fixedTokens{err: errB}
-		chain := newChainTokens(&fixedTokens{cred: []byte("from-file")}, second)
-		got, err := chain.Credentials()
+func TestFreshestTokens(t *testing.T) {
+	now := time.Now()
+	live := credJSONExpiring(t, "live", now.Add(7*time.Hour))
+	stale := credJSONExpiring(t, "stale", now.Add(-20*time.Hour))
+	tokenOf := func(t *testing.T, raw []byte) string {
+		t.Helper()
+		creds, err := accessToken(raw)
 		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
+			t.Fatalf("accessToken: %v", err)
 		}
-		if string(got) != "from-file" {
-			t.Fatalf("got %q, want %q", got, "from-file")
+		return creds.Token
+	}
+
+	t.Run("later expiry wins regardless of order", func(t *testing.T) {
+		// A stale credentials file must not shadow the live Keychain token.
+		for _, order := range [][]TokenProvider{
+			{&fixedTokens{cred: live}, &fixedTokens{cred: stale}},
+			{&fixedTokens{cred: stale}, &fixedTokens{cred: live}},
+		} {
+			got, err := newFreshestTokens(order...).Credentials()
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if tok := tokenOf(t, got); tok != "live" {
+				t.Errorf("got token %q, want live", tok)
+			}
 		}
 	})
 
-	t.Run("falls back to second when first fails", func(t *testing.T) {
-		chain := newChainTokens(&fixedTokens{err: errA}, &fixedTokens{cred: []byte("from-keychain")})
-		got, err := chain.Credentials()
+	t.Run("tie keeps provider order", func(t *testing.T) {
+		exp := now.Add(time.Hour)
+		got, err := newFreshestTokens(
+			&fixedTokens{cred: credJSONExpiring(t, "keychain", exp)},
+			&fixedTokens{cred: credJSONExpiring(t, "file", exp)},
+		).Credentials()
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if string(got) != "from-keychain" {
-			t.Fatalf("got %q, want %q", got, "from-keychain")
+		if tok := tokenOf(t, got); tok != "keychain" {
+			t.Errorf("got token %q, want keychain", tok)
+		}
+	})
+
+	t.Run("blob without expiresAt ranks below one with it", func(t *testing.T) {
+		got, err := newFreshestTokens(
+			&fixedTokens{cred: credJSON(t, "no-expiry")},
+			&fixedTokens{cred: stale},
+		).Credentials()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if tok := tokenOf(t, got); tok != "stale" {
+			t.Errorf("got token %q, want stale", tok)
+		}
+	})
+
+	t.Run("failing or tokenless providers are skipped", func(t *testing.T) {
+		got, err := newFreshestTokens(
+			&fixedTokens{err: errors.New("keychain locked")},
+			&fixedTokens{cred: []byte(`{"claudeAiOauth":{"accessToken":""}}`)},
+			&fixedTokens{cred: live},
+		).Credentials()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if tok := tokenOf(t, got); tok != "live" {
+			t.Errorf("got token %q, want live", tok)
 		}
 	})
 
 	t.Run("all fail, errors joined", func(t *testing.T) {
-		chain := newChainTokens(&fixedTokens{err: errA}, &fixedTokens{err: errB})
-		_, err := chain.Credentials()
+		errA := errors.New("keychain empty")
+		errB := errors.New("file missing")
+		_, err := newFreshestTokens(&fixedTokens{err: errA}, &fixedTokens{err: errB}).Credentials()
 		if err == nil {
 			t.Fatal("expected error when all providers fail")
 		}

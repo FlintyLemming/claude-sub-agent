@@ -71,16 +71,16 @@ func parseRetryAfter(header http.Header) time.Duration {
 	return time.Duration(secs) * time.Second
 }
 
-// TokenProvider reads the raw Claude Code credentials JSON out of macOS Keychain.
-// Abstracted as an interface so tests can inject a stub instead of shelling out
-// to the real `security` command.
+// TokenProvider reads the raw Claude Code credentials JSON (from the macOS
+// Keychain and/or the credentials file). Abstracted as an interface so tests can
+// inject a stub instead of shelling out to the real `security` command.
 type TokenProvider interface {
-	// Credentials returns the raw JSON blob stored in Keychain for Claude Code.
+	// Credentials returns the raw JSON blob Claude Code stores its OAuth token in.
 	Credentials() ([]byte, error)
 }
 
-// TokenRefresher runs a no-op Claude Code invocation so the CLI refreshes and
-// persists a new OAuth token to Keychain. Abstracted for test stubbing.
+// TokenRefresher has the Claude Code CLI refresh and persist a new OAuth token
+// to its own credential store. Abstracted for test stubbing.
 type TokenRefresher interface {
 	Refresh(ctx context.Context) error
 }
@@ -141,12 +141,50 @@ type Collector struct {
 	Refresher TokenRefresher
 	API       UsageAPI
 
-	// lastFailedToken remembers a token that was still unauthorized after a
-	// refresh. While the credentials source keeps returning it, cycles are
-	// skipped without touching the API — retrying a known-bad token is what
-	// provokes upstream 429s. Cleared when a different token shows up or a
-	// cycle succeeds.
+	// Auth-failure guard. After a cycle fails on auth (the refresh errored or
+	// left the token expired, or the API still said 401), cycles that see the
+	// same token are skipped without touching the CLI or the API until
+	// authRetryAt — retrying a known-bad token is what provokes upstream 429s.
+	// The wait doubles per consecutive failure (authRetryDelay), so a transient
+	// failure such as no network right after wake is retried soon instead of
+	// stalling until the user next runs the CLI. A different token showing up
+	// lifts the guard early; a successful cycle resets it.
 	lastFailedToken string
+	authRetryAt     time.Time
+	authFailures    int
+
+	// now is the clock; nil means time.Now. Overridden in tests.
+	now func() time.Time
+}
+
+// authRetryBase and authRetryMax bound the auth-failure backoff: 5m, 10m, 20m,
+// 40m, then hourly.
+const (
+	authRetryBase = 5 * time.Minute
+	authRetryMax  = time.Hour
+)
+
+// authRetryDelay is the wait after the n-th consecutive auth failure (n >= 1).
+func authRetryDelay(n int) time.Duration {
+	d := authRetryBase
+	for i := 1; i < n && d < authRetryMax; i++ {
+		d *= 2
+	}
+	return min(d, authRetryMax)
+}
+
+func (c *Collector) clock() time.Time {
+	if c.now != nil {
+		return c.now()
+	}
+	return time.Now()
+}
+
+// authFailed arms the auth-failure guard for token.
+func (c *Collector) authFailed(token string) {
+	c.authFailures++
+	c.lastFailedToken = token
+	c.authRetryAt = c.clock().Add(authRetryDelay(c.authFailures))
 }
 
 // apiResponse mirrors the shape returned by the usage endpoint. Only the
@@ -217,9 +255,11 @@ type quota struct {
 	ResetsAt    string  `json:"resets_at"`
 }
 
-// expiryLeeway is how close to expiresAt a token is already treated as
-// expired, mirroring the CLI's own ~60s proactive-refresh window.
-const expiryLeeway = 60 * time.Second
+// expiryLeeway is how close to expiresAt a token is already treated as expired.
+// It matches the CLI's own refresh window (5 minutes before expiresAt) and must
+// not exceed it: the CLI skips a refresh it doesn't consider due, so a wider
+// window here would ask for refreshes the CLI declines.
+const expiryLeeway = 5 * time.Minute
 
 // oauthCreds is the decoded token material from the credentials blob.
 // ExpiresAt is zero when the blob carries no expiry (older formats) — such a
@@ -277,26 +317,29 @@ func (c *Collector) Collect(ctx context.Context) (payload *Payload, ops []string
 	if err != nil {
 		return nil, ops, err
 	}
-	if c.lastFailedToken != "" && creds.Token == c.lastFailedToken {
-		return nil, ops, errors.New("auth failed previously and token is unchanged; waiting for the CLI to rotate credentials")
+	if c.lastFailedToken != "" && creds.Token == c.lastFailedToken && c.clock().Before(c.authRetryAt) {
+		return nil, ops, fmt.Errorf("auth failed previously and token is unchanged; next attempt at %s unless the credentials change",
+			c.authRetryAt.Format(time.RFC3339))
 	}
 
 	// Local expiry check: never spend a request on a token we already know is
-	// stale. If the refresh doesn't rotate it (CLI idle, update a no-op), arm
-	// the guard so we go quiet until new credentials appear.
-	if creds.expired(time.Now()) {
+	// stale (expired tokens have been reported to get a 429 from the usage
+	// endpoint, not a 401). If the refresh fails or doesn't rotate it, arm the
+	// guard.
+	if creds.expired(c.clock()) {
 		ops = append(ops, "refresh-token")
 		log.Printf("collector: token expired locally (expiresAt=%s), refreshing", creds.ExpiresAt.Format(time.RFC3339))
 		if rerr := c.Refresher.Refresh(ctx); rerr != nil {
+			c.authFailed(creds.Token)
 			return nil, ops, fmt.Errorf("refresh token: %w", rerr)
 		}
 		creds, err = c.readToken()
 		if err != nil {
 			return nil, ops, err
 		}
-		if creds.expired(time.Now()) {
-			c.lastFailedToken = creds.Token
-			return nil, ops, errors.New("token still expired after refresh; waiting for the CLI to rotate credentials")
+		if creds.expired(c.clock()) {
+			c.authFailed(creds.Token)
+			return nil, ops, errors.New("token still expired after refresh")
 		}
 	}
 	token := creds.Token
@@ -313,6 +356,7 @@ func (c *Collector) Collect(ctx context.Context) (payload *Payload, ops []string
 		ops = append(ops, "refresh-token")
 		log.Printf("collector: token expired (401), refreshing")
 		if rerr := c.Refresher.Refresh(ctx); rerr != nil {
+			c.authFailed(token)
 			return nil, ops, fmt.Errorf("refresh token: %w", rerr)
 		}
 		creds, err = c.readToken()
@@ -328,7 +372,7 @@ func (c *Collector) Collect(ctx context.Context) (payload *Payload, ops []string
 	}
 	if status == http.StatusUnauthorized {
 		ops = append(ops, "api-failed")
-		c.lastFailedToken = token
+		c.authFailed(token)
 		return nil, ops, errors.New("usage api: still unauthorized after refresh")
 	}
 	if status == http.StatusTooManyRequests {
@@ -353,6 +397,7 @@ func (c *Collector) Collect(ctx context.Context) (payload *Payload, ops []string
 
 	ops = append(ops, "api-ok")
 	c.lastFailedToken = ""
+	c.authFailures = 0
 	payload = &Payload{
 		SevenDay: quota{Utilization: apiResp.SevenDay.Utilization, ResetsAt: apiResp.SevenDay.ResetsAt},
 		FiveHour: quota{Utilization: apiResp.FiveHour.Utilization, ResetsAt: apiResp.FiveHour.ResetsAt},
