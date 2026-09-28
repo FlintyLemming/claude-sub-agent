@@ -1,6 +1,6 @@
 # claude-usage-agent
 
-A small, stateless binary (macOS + Windows) that periodically collects [Claude Code](https://www.anthropic.com/claude-code) subscription usage and POSTs it to a local HTTP service. Runs as a `launchd` agent on macOS or a Task Scheduler logon task on Windows. **No GUI, no local storage** — all history, deltas, and aggregation belong to the service that receives the pushes.
+A small, stateless binary (macOS, Linux, Windows) that periodically collects [Claude Code](https://www.anthropic.com/claude-code) subscription usage and POSTs it to a local HTTP service. Runs as a `launchd` agent on macOS, a systemd user service on Linux, or a Task Scheduler logon task on Windows. **No GUI, no local storage** — all history, deltas, and aggregation belong to the service that receives the pushes.
 
 This is a Go reimplementation of the collection half of a reference Python tracker, stripped of the menu-bar app and local stats so the binary is a single-responsibility **collect-and-forward** agent.
 
@@ -10,7 +10,7 @@ Every collection cycle:
 
 1. Read the OAuth token + `expiresAt` from the Claude Code credentials source:
    - macOS: both the Keychain (`security find-generic-password -s "Claude Code-credentials"`, where the CLI keeps its live token) and `$CLAUDE_CONFIG_DIR/.credentials.json` (default `~/.claude/`); whichever token expires later wins, so a stale leftover file can't shadow the live Keychain token.
-   - Windows: the credentials file only (there is no Keychain equivalent).
+   - Linux / Windows: the credentials file only (Claude Code has no keyring backend there).
 2. If `expiresAt` is within 5 minutes (the CLI's own refresh window), have the CLI refresh it first — see [Token refresh](#token-refresh). The stale token is never sent (expired tokens have been reported to get a `429` from the usage endpoint rather than a `401`, which would look like rate limiting).
 3. `GET https://api.anthropic.com/api/oauth/usage` with the bearer token and a `claude-code/<version>` User-Agent.
 4. On `401`, refresh the same way and retry the API once.
@@ -53,14 +53,32 @@ The Bearer token must match the server's `push_auth_secret`. When the server run
 
 ## Install
 
+`make install` builds the binary, copies it to `$(PREFIX)`, and runs the installed copy's `install` subcommand, so the service points at the installed binary. `make` can't pass flags through, so set them in the environment — they are resolved and baked into the service definition:
+
+```bash
+CLAUDE_USAGE_PUSH_URL=https://<host>/api/push/v2/<instance_id> \
+CLAUDE_USAGE_PUSH_TOKEN=<push_auth_secret> \
+make install
+```
+
+(or run `claude-usage-agent install --push-url=... --push-token=...` yourself).
+
 macOS:
 
 ```bash
-make build          # produces ./claude-usage-agent (darwin/arm64)
-make install        # builds, installs the binary, registers the launchd agent
+make build          # produces ./claude-usage-agent for the current host
+make install        # PREFIX defaults to /usr/local/bin (needs sudo) — or PREFIX=$HOME/.local/bin
 ```
 
 `install` writes `~/Library/LaunchAgents/com.user.claude-usage-agent.plist` (with `KeepAlive` + `RunAtLoad`) and runs `launchctl load`. The flags you pass at install time are baked into the plist's `ProgramArguments`.
+
+Linux (systemd):
+
+```bash
+make install        # PREFIX defaults to ~/.local/bin; per-user service, so no sudo
+```
+
+`install` writes `~/.config/systemd/user/claude-usage-agent.service` (mode `0600`, since `ExecStart` carries the push token; `Restart=always`), then runs `systemctl --user daemon-reload`, `enable` and `restart`. Your current `PATH` is baked into the unit: the user manager's default `PATH` lacks `~/.local/bin`, where the `claude` CLI usually lives. A user service only runs while you have a login session unless lingering is on — `loginctl enable-linger` keeps it running after logout and starts it at boot (`install` prints a hint when it's off).
 
 Windows:
 
@@ -95,7 +113,7 @@ Commands:
 
 ### Logs
 
-Under launchd, stdout/stderr are redirected to `~/Library/Logs/claude-usage-agent.log`. Each cycle logs one structured line: timestamp, ops performed (`api-ok` / `refresh-token` / `fable-ok` / `api-failed`), elapsed time, and any error.
+Under launchd, stdout/stderr are redirected to `~/Library/Logs/claude-usage-agent.log`; under systemd they go to the journal (`journalctl --user -u claude-usage-agent`). Each cycle logs one structured line: timestamp, ops performed (`api-ok` / `refresh-token` / `fable-ok` / `api-failed`), elapsed time, and any error.
 
 ## Development
 
@@ -114,14 +132,17 @@ pusher.go                 HTTP POST with 3× exponential-backoff retry (1s/2s/4s
 daemon.go                 Collect loop with Retry-After-aware 429 backoff
 commands.go               Cross-platform wrappers: credentials file, `claude` CLI refresh, User-Agent
 tokens_darwin.go          macOS credential sources (Keychain + file, later expiry wins)
+tokens_linux.go           Linux credential source (file only)
 tokens_windows.go         Windows credential source (file only)
 service.go                Shared service-manager plumbing (shellRunner, statusInfo)
 service_darwin.go         launchd: plist generation + launchctl
+service_linux.go          systemd entry points
+service_systemd.go        systemd user unit + systemctl logic (tag-free so it's unit-tested on any OS)
 service_windows.go        Task Scheduler entry points
 service_windows_core.go   schtasks logic (tag-free so it's unit-tested on any OS)
 ```
 
-External commands (`security`, `claude`, `launchctl`, `schtasks`) and the Usage API are behind small interfaces (`TokenProvider`, `TokenRefresher`, `UsageAPI`, `shellRunner`), so the tests inject stubs and `httptest.Server` mocks instead of touching the Keychain, Task Scheduler, or the real network.
+External commands (`security`, `claude`, `launchctl`, `systemctl`, `schtasks`) and the Usage API are behind small interfaces (`TokenProvider`, `TokenRefresher`, `UsageAPI`, `shellRunner`), so the tests inject stubs and `httptest.Server` mocks instead of touching the Keychain, systemd, Task Scheduler, or the real network.
 
 ## Scope (what this is *not*)
 
